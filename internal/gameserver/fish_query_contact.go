@@ -20,6 +20,8 @@ func hSocialMembers(ctx *Ctx) ([]byte, bool) {
 	s := ctx.Sess.Srv
 	ids := []uint32{uint32(fishQueryContactUID), uint32(gearAssistantUID)}
 	seen := map[int64]bool{fishQueryContactUID: true, gearAssistantUID: true}
+	// 两个系统联系人固定占据前两位，后续真实会话和虚拟玩家都从下标 2 起排。
+	// 之前 sort.Slice(ids[2:]) 依赖这里恰好只有两个固定项，改动前必须保留这个契约。
 	s.mu.Lock()
 	for _, peer := range s.sessions {
 		if peer != nil && !peer.Closed() && peer.Userid > 0 && !seen[peer.Userid] {
@@ -28,6 +30,16 @@ func hSocialMembers(ctx *Ctx) ([]byte, bool) {
 		}
 	}
 	s.mu.Unlock()
+	// 虚拟玩家 UID 段在 900000000+，比任何真实账号都大，排序后真实玩家
+	// 仍然排在最前面，虚拟名册只占列表尾部。
+	for _, vp := range s.onlineVirtualPlayers() {
+		u := uint32(vp.UID)
+		if seen[int64(u)] {
+			continue
+		}
+		ids = append(ids, u)
+		seen[int64(u)] = true
+	}
 	sort.Slice(ids[2:], func(i, j int) bool { return ids[i+2] < ids[j+2] })
 	return encodeSocialTree(ctx, proto.U32Arr(ids))
 }

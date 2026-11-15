@@ -139,10 +139,13 @@ func (s *Server) Table() *proto.OpsTable { return s.table }
 func (s *Server) Serve(ln net.Listener) error {
 	cleanupStop := make(chan struct{})
 	cleanupDone := make(chan struct{})
+	worldDone := make(chan struct{})
 	go s.runDrinkUseReceiptCleanup(cleanupStop, cleanupDone)
+	go s.runVirtualWorldEvents(cleanupStop, worldDone)
 	defer func() {
 		close(cleanupStop)
 		<-cleanupDone
+		<-worldDone
 	}()
 	for {
 		nc, err := ln.Accept()
