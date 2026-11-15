@@ -61,6 +61,8 @@ bin\launcher.exe
 
 首次使用时，launcher 会初始化数据库，启动 `gameserver` 和 `gateway`，执行健康检查，并重启已退出的进程。管理后台 handler 直接内嵌在 launcher 中，统一入口为 `http://127.0.0.1:9500`，不再监听独立的 8080 管理端口。
 
+配置 `ai.enabled: true` 时，launcher 还会拉起可选的 `aibridge` 进程（观测入口 `http://127.0.0.1:9504/healthz`），控制中心会显示一张与 gameserver/gateway 同级的 aibridge 状态卡，可单独启停/重启并查看健康状态。它挂掉不会影响游戏进程，launcher 会按指数退避自动重启。AI 的厂商、模型、API Key 与出声开关都在管理后台「AI 助手」页配置。
+
 ### 从控制中心启动游戏
 
 在统一控制中心的“运行控制”页填写 `rf4_x64.exe` 的绝对路径并保存。路径会写入当前 `config.yaml` 的：
@@ -86,9 +88,10 @@ D:\Games\RF4EN\Game\rf4_x64.exe -region CN
 ```powershell
 bin\gameserver.exe -config config.yaml
 bin\gateway.exe -config config.yaml
+bin\aibridge.exe  -config config.yaml   # 可选：AI 助手
 ```
 
-手动运行这两个进程不会启动管理控制台；管理控制台随 `launcher` 的 9500 统一入口提供。
+手动运行这些进程不会启动管理控制台；管理控制台随 `launcher` 的 9500 统一入口提供。`aibridge` 依赖 gameserver/seed 先完成数据库迁移。
 
 默认本地开发凭据为 `admin` / `admin123`。对于任何未与本地计算机隔离的环境，请在 `config.yaml` 中替换这些凭据。
 
@@ -168,11 +171,11 @@ go build -trimpath -ldflags "-s -w -X 'rf4server/internal/buildinfo.Version=<语
 请先检查：
 - Windows 版本，以及当前是否以管理员权限运行；
 - Go 是否已安装，版本是否不低于 1.27.3；
-- 443、9341、9401、9500-9502 端口是否可用。
+- 443、9341、9401、9500-9504 端口是否可用。
 
 然后完成以下工作：
 1. 阅读 README.md、config.yaml 和 docs/deploy.md，说明你将执行的操作。
-2. 构建项目，确认 bin 下生成 gateway.exe、gameserver.exe、seed.exe 和 launcher.exe。
+2. 构建项目，确认 bin 下生成 gateway.exe、gameserver.exe、seed.exe、aibridge.exe 和 launcher.exe。
 3. 检查 config.yaml 中 gateway.tunnel.psk 与 game.tunnel.psk 一致，sqlite.static_path 指向 server_data/static.sqlite3。
 4. 备份 C:\Windows\System32\drivers\etc\hosts，然后把 api.rf4game.ru 和 api.rf4game.com 指向 127.0.0.1。
 5. 启动一次 gateway 生成 certs/server.crt 和 certs/server.key，并指导我把 server.crt 安装到“受信任的根证书颁发机构”。不要上传或分享私钥。

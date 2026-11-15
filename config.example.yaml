@@ -58,6 +58,15 @@ admin:
   username: "admin"                           # 管理员用户名。
   password: "replace-with-strong-password"   # 管理员密码；每次启动 admin 时应用。
 
+ai:
+  enabled: true                        # 默认由 launcher 拉起；未填 Key 时只走模板降级，不出网
+  obs_addr: "127.0.0.1:9504"           # aibridge 健康检查与队列状态，仅本机
+  poll_interval_ms: 500                # ai_task 轮询间隔
+  request_timeout_sec: 20              # 单次模型请求超时
+  max_concurrent: 2                    # 全局并发上限
+  master_key_file: "data/ai_master.key"  # API Key 加密主密钥，留在运行版本地，不入库
+  # 出网 / 联网搜索 / 紧急停止在管理后台「AI 助手」页配置，写入 ai_setting。
+
 # 支持的环境变量覆盖：
 # RF4_LOG_LEVEL、RF4_LOG_FORMAT、RF4_SQLITE_PATH、RF4_SQLITE_STATIC_PATH、
 # RF4_GATEWAY_LOGIN_ADDR、RF4_GATEWAY_REALTIME_ADDR、RF4_GATEWAY_ADVERTISE_HOST、

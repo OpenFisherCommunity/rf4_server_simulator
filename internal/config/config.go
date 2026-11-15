@@ -23,6 +23,19 @@ type Config struct {
 	Game     Game     `yaml:"game"`
 	Admin    Admin    `yaml:"admin"`
 	Launcher Launcher `yaml:"launcher"`
+	AI       AI       `yaml:"ai"`
+}
+
+// AI 是 aibridge 进程的本地配置。
+// 出网、联网搜索、紧急停止属于运行期开关，统一由后台写入 ai_setting，
+// 这里只保留进程级参数，避免配置文件和数据库两套真值。
+type AI struct {
+	Enabled           bool    `yaml:"enabled"`
+	ObsAddr           string  `yaml:"obs_addr"`
+	PollIntervalMS    int     `yaml:"poll_interval_ms"`
+	RequestTimeoutSec float64 `yaml:"request_timeout_sec"`
+	MaxConcurrent     int     `yaml:"max_concurrent"`
+	MasterKeyFile     string  `yaml:"master_key_file"`
 }
 
 // SQLite 本地单文件数据库（多进程共享，WAL 并发）。
@@ -163,6 +176,14 @@ func defaults() *Config {
 			Username:  "admin",
 			Password:  "admin123",
 		},
+		AI: AI{
+			Enabled:           true, // 默认拉起；未配 Key 时只走模板降级，不产生出网请求
+			ObsAddr:           "127.0.0.1:9504",
+			PollIntervalMS:    500,
+			RequestTimeoutSec: 20,
+			MaxConcurrent:     2,
+			MasterKeyFile:     "data/ai_master.key",
+		},
 	}
 }
 
@@ -216,6 +237,9 @@ func (c *Config) validate() error {
 	}
 	if c.Gateway.AdvertisePort == 0 {
 		return fmt.Errorf("gateway.advertise_port 未配置")
+	}
+	if c.AI.Enabled && strings.TrimSpace(c.AI.MasterKeyFile) == "" {
+		return fmt.Errorf("ai.master_key_file 未配置")
 	}
 	return nil
 }

@@ -731,6 +731,12 @@ func hSocialMove(ctx *Ctx) ([]byte, bool) {
 		"users":   ch.Users,
 		"private": false,
 	})
+	// 记录客户端实际用过的频道，后台下拉才有真实选项。
+	if srv := ctx.Sess.Srv; srv != nil && srv.DB != nil {
+		if err := srv.DB.AIUpsertChannel(ctx.Sess.pushCtx(), name); err != nil {
+			srv.log.Warn("频道记录失败", "channel", name, "err", err)
+		}
+	}
 	return []byte{0x00}, true
 }
 
@@ -749,6 +755,11 @@ func hSocialPublic(ctx *Ctx) ([]byte, bool) {
 		return nil, true
 	}
 	ch := sessChannel(ctx.Sess)
+	srv := ctx.Sess.Srv
+	// @邀请 / @移出：把 Agent 拉进或移出当前频道，命中即吞掉该消息。
+	if srv.DB != nil && srv.handleAIChannelCommand(ctx, msg, ch.Name) {
+		return nil, true
+	}
 	// 外层 locationId 发空串：客户端 peilhchjenn 对频道名做严格相等校验，
 	// 带 [CN] 或 sessChannel 默认名都不匹配当前标签页而被静默丢弃；空串
 	// 无条件放行（与 pushChatProbe 同一结论，2026-11-04 反编译+对照实证）。
@@ -758,7 +769,6 @@ func hSocialPublic(ctx *Ctx) ([]byte, bool) {
 		users = 1
 	}
 	// 公聊广播给所有在线会话；只回显发送者会导致多人频道互相看不到。
-	srv := ctx.Sess.Srv
 	srv.mu.Lock()
 	peers := make([]*Session, 0, len(srv.sessions))
 	for _, sess := range srv.sessions {
@@ -773,6 +783,8 @@ func hSocialPublic(ctx *Ctx) ([]byte, bool) {
 	for _, sess := range peers {
 		sess.Push(24, 27, buildChatEchoPush(loc, msg, uint64(ctx.Sess.Userid), uint32(users)))
 	}
+	// 真人发言才可能触发 AI；AI 的 24/27 推送不会回到这里。
+	srv.maybeTriggerChannelAI(ctx, ch.Name, msg)
 	return nil, true // fire-and-forget，不返回响应
 }
 
