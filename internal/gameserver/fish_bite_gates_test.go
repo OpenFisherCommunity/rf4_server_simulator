@@ -66,19 +66,25 @@ func TestBiteGateLayerFloor(t *testing.T) {
 		}
 		return 0
 	}
-	// 江鳕（layer 0.435~0.992）攻水面拟饵（0.06）：只剩 1% 杂口。
+	// 江鳕（v4.1 带 0.38~1.0）攻水面拟饵（0.06）：只剩 1% 杂口。
 	if w := run(fishRollContext{rigType: 5, lureLayer: 0.06, baits: []string{"rule_lure"}, now: time.Now()}, "burbot"); w != cfg.layerFloor {
 		t.Fatalf("burbot at surface must hit floor, got %v", w)
 	}
-	// 河鲈（layer 0.061~0.965）攻水面拟饵：正常权重。
-	if w := run(fishRollContext{rigType: 5, lureLayer: 0.06, baits: []string{"rule_lure"}, now: time.Now()}, "perch"); w != 1 {
-		t.Fatalf("perch at surface must keep full weight, got %v", w)
+	// 河鲈（v4.1 带 0.245~0.695）攻带内拟饵（0.30）：正常权重；水面拟饵（0.06）
+	// 已在带外（容差 0.15），按设计被地板，不再是无差别放行。
+	if w := run(fishRollContext{rigType: 5, lureLayer: 0.30, baits: []string{"rule_lure"}, now: time.Now()}, "perch"); w != 1 {
+		t.Fatalf("perch in band must keep full weight, got %v", w)
 	}
-	// 泥鳅（layer 0.435~0.988）浮钓近底（400cm→0.8）：带内不受影响。
+	if w := run(fishRollContext{rigType: 5, lureLayer: 0.06, baits: []string{"rule_lure"}, now: time.Now()}, "perch"); w != cfg.layerFloor {
+		t.Fatalf("perch at surface must hit floor, got %v", w)
+	}
+	// 泥鳅（v4.1 带 0.525~0.975）浮钓近底（400cm→0.8）：带内不受影响。
 	if w := run(fishRollContext{rigType: 1, depthCM: 400, baits: []string{"rule_worm"}, now: time.Now()}, "vjun"); w != 1 {
 		t.Fatalf("loach near bottom must keep full weight, got %v", w)
 	}
-	// 底钓（0.93）对鲤科/底栖带鱼零误伤：没有任何鱼种的 layer_max < 0.78。
+	// 底钓（0.93）对鲤科/底栖带鱼零误伤：鲫鱼带 0.54~0.98 在容差内。
+	// v4.1 数据里上层鱼（茴鱼/白鲑等 layer_max=0.45）底钓会被地板——上层鱼
+	// 不该被底钓钓起，正是 G2 的设计语义。
 	if w := run(fishRollContext{rigType: 12, baits: []string{"rule_worm"}, now: time.Now()}, "crucian"); w != 1 {
 		t.Fatalf("crucian on bottom rig must keep full weight, got %v", w)
 	}

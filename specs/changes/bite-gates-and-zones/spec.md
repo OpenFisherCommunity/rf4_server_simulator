@@ -60,7 +60,7 @@ Status: done
 - tunables：`bite_gate_enabled`（默认 0）、`bite_gate_lure_diet_min`（0.30）、
   `bite_gate_layer_floor`（0.01）、`bite_gate_diet_min`（0.25，高于合成基线 0.2 噪声地板）、
   `bite_gate_diet_floor`（0.05）。游戏参数页可调，规则条可开关。
-- 数据与迁移：`00060_fish_zone.sql`（`fish_zone` + `fish_zone_fish`，`IF NOT EXISTS` 可重复执行，
+- 数据与迁移：`00065_fish_zone.sql`（`fish_zone` + `fish_zone_fish`，`IF NOT EXISTS` 可重复执行，
   已登记 `RuntimeTables`）；不动静态库；不动存档格式（`fishRollContext` 新增 `gateBlocked *bool`
   纯运行时字段）。
 - 兼容：客户端对鱼种选择零语义校验（14/14 发什么渲染什么），服务端任意收紧不触协议；
