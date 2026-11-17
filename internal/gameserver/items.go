@@ -827,6 +827,9 @@ func (s *Server) rebuildRod(ctx context.Context, it *store.Item, obj *proto.Valu
 			if idx := fieldIdxByCS(old.Class, csDurability); idx >= 0 && idx < old.FieldCount() {
 				setReelChildDurability(child, reelChildDurability(old))
 			}
+			if idx := fieldIdxByCS(old.Class, csCreated); idx >= 0 && idx < old.FieldCount() {
+				child.Fields[fieldIdxByCS(child.Class, csCreated)].Num = old.Fields[idx].Num
+			}
 		}
 		obj.Fields[i].Val = child
 	}

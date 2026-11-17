@@ -211,12 +211,9 @@ func TestReelPartSnapshotWorkshop(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				pushed, err := proto.EncodeValue(v.ArgItem(0), srv.Table())
-				if err != nil {
-					t.Fatal(err)
-				}
-				if string(pushed) != string(body) {
-					t.Fatal("AfterResponse differs from response")
+				assertWorkshopPushMatchesResponse(t, srv, v.ArgItem(0), body)
+				if balancePush := awaitPushEnvelope(t, peer); balancePush.Main != 2 || balancePush.Sub != 1 {
+					t.Fatal("missing balance refresh")
 				}
 				def, defErr := db.GetItemDefByItemID(ctx, id)
 				if defErr != nil || def == nil {
@@ -525,12 +522,9 @@ func TestReelPartSnapshotBatchAndUnrelatedParts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			pushed, err := proto.EncodeValue(value.ArgItem(0), srv.Table())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(pushed) != string(body) {
-				t.Fatal("batch refresh differs from response")
+			assertWorkshopPushMatchesResponse(t, srv, value.ArgItem(0), body)
+			if balancePush := awaitPushEnvelope(t, peer); balancePush.Main != 2 || balancePush.Sub != 1 {
+				t.Fatal("missing balance refresh")
 			}
 			// Even after building and sending a projected tree, the persistent child state remains untouched.
 			checkProtected()

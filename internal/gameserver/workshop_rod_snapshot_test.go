@@ -56,6 +56,10 @@ func TestWorkshopRodReplacementSurvivesSnapshot(t *testing.T) {
 		if got := child.Fields[fieldIdxByCS(child.Class, csGUID)].Hex; got != wantGUID {
 			t.Fatalf("%s 部件 GUID 与诊断不一致", name)
 		}
+		ci := fieldIdxByCS(child.Class, csCreated)
+		if child.Fields[ci].U64() == 0 || child.Fields[ci].U64() != installed.Fields[ci].U64() {
+			t.Fatalf("%s 手柄版本未保留", name)
+		}
 	}
 	for name, rig := range map[string]*proto.Value{"persisted": persisted[5].Val, "reply": reply.Fields[5].Val, "reload": reloaded.Fields[5].Val} {
 		count := 0

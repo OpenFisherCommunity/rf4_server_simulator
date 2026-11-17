@@ -36,8 +36,8 @@ func registerEconMarket(d *Dispatch) {
 	d.Register(20, 4, hMarketSellOffer)
 	d.Register(21, 1, hWorkshopList)
 	d.Register(21, 2, hWorkshopDiag)
-	d.Register(21, 3, hWorkshopOrder) // 官方语义：订购/更换零件（含修理）
-	d.Register(21, 4, hWorkshopOrder) // 官方金币通道同样是换件结构
+	d.Register(21, 3, hWorkshopPreview) // 选择配件后的预览，不落库、不扣费
+	d.Register(21, 4, hWorkshopOrder)   // 确认支付；币种由请求 f2 指定
 	d.Register(17, 12, hRodSetDepth)
 	d.Register(17, 13, hRodSetClip)
 	d.Register(17, 14, hRodSetDrag)
@@ -1024,6 +1024,10 @@ func (s *Server) partAlternatives(ctx context.Context, reelItemID string, part r
 		}
 		seen[itemID] = true
 		silver, gold := s.partPrice(ctx, itemID, def.Category)
+		if itemID == def.ItemID {
+			// 客户端确认费用来自所选工单，必须与同型号修理费用一致。
+			silver, gold = workshopPartRepairPrice(part.Cond), 0
+		}
 		comp := wiregen.MustMakeObj("oifghenlghh", map[int]*proto.Value{
 			0: proto.U64(uint64(silver / 10)),
 			1: proto.U64(uint64(gold / 10)),
@@ -1242,6 +1246,14 @@ func workshopSlots(ctx context.Context, srv *Server, guid string) []uint32 {
 	return out
 }
 
+// workshopPartRepairPrice 以分计费；非零磨损不能取整成“无需修理”。
+func workshopPartRepairPrice(condition float64) int64 {
+	if condition >= 1 {
+		return 0
+	}
+	return int64(math.Max(1, math.Round(math.Max(0, 1-condition)*500)))
+}
+
 // hWorkshopDiag 处理 21/2，返回 503 物品诊断：
 // 物品 GUID 和 152 组件列表，组件包含槽位、GUID 与折旧百分比。
 func hWorkshopDiag(ctx *Ctx) ([]byte, bool) {
@@ -1261,7 +1273,7 @@ func hWorkshopDiag(ctx *Ctx) ([]byte, bool) {
 	if row, rerr := srv.DB.GetItemByGUID(cctx, guid); rerr == nil && row != nil {
 		for _, p := range srv.repairPartsOf(cctx, row) {
 			// f3 = 该零件的修理报价，完好度 1.0 时为 0。
-			repairSilver := int64(math.Round(math.Max(0, 1-p.Cond) * 500))
+			repairSilver := workshopPartRepairPrice(p.Cond)
 			comps.Items = append(comps.Items, wiregen.MustMakeObj("hlopebmchhp", map[int]*proto.Value{
 				0: proto.Guid(p.GUID),
 				1: proto.U32(proto.F32Bits(float32(p.Cond))),
@@ -1311,7 +1323,7 @@ func workshopQuoteMatches(clientCost, serverCost int64) bool {
 	return delta <= tolerance
 }
 
-// hWorkshopOrder 处理 21/3：按客户端提交的条目更换零件、扣费并返回更新后的物品树。
+// hWorkshopOrder 处理 21/4：确认所选零件、扣费并返回更新后的物品树。
 //
 // 官方请求结构（抓包确认）：
 //
@@ -1320,6 +1332,14 @@ func workshopQuoteMatches(clientCost, serverCost int64) bool {
 //	                          args(503)[ {BYTE 品类, STR 新件 systemID} ... ],
 //	                          是否金币, 客户端报价 } ]
 func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
+	return workshopOrder(ctx, false)
+}
+
+func hWorkshopPreview(ctx *Ctx) ([]byte, bool) {
+	return workshopOrder(ctx, true)
+}
+
+func workshopOrder(ctx *Ctx, preview bool) ([]byte, bool) {
 	srv := ctx.Sess.Srv
 	if !srv.requireDB(ctx) {
 		return nil, false
@@ -1421,7 +1441,7 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 					old = cond
 				}
 				ch.Fields[didx].Num = ptrU64(uint64(math.Float32bits(1.0)))
-				silver += int64(math.Round(math.Max(0, 1-old) * 500))
+				silver += workshopPartRepairPrice(old)
 				conditions[o.Cat] = 1
 			}
 			if isReel && o.Cat == uint32(reelPartCatWasher) {
@@ -1432,6 +1452,9 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 				if _, present, idx := frictionWasherDrag(ch); present {
 					setWireFloat(ch.Fields, ch.Class, idx, itemDefF32(def, gearAttrDragMax)*row.Workmanship)
 				}
+			}
+			if !preview {
+				bumpCreatedTicks(ch.Fields, ch.Class)
 			}
 			changed = true
 			continue
@@ -1448,6 +1471,16 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 		// 全新件必须写满耐久：轮内零件耐久会聚合成本体那一格，换上去就缺耐久
 		// 等于给玩家装了一只坏件，本体永远抬不回来。
 		setReelChildDurability(child, 1)
+		if !preview {
+			// 同一槽位可能复用 GUID，子件也必须有更新的版本。
+			if ci := fieldIdxByCS(child.Class, csCreated); ci >= 0 {
+				old := fields[idx].Val
+				if oi := fieldIdxByCS(old.Class, csCreated); oi >= 0 {
+					child.Fields[ci].Num = ptrU64(old.Fields[oi].U64())
+				}
+			}
+			bumpCreatedTicks(child.Fields, child.Class)
+		}
 		fields[idx].Val = child
 		ps, pg := srv.partPrice(cctx, o.SysID, def.Category)
 		silver += ps
@@ -1457,19 +1490,18 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 	if !changed {
 		return nil, false
 	}
-	if useGold && hasRepair {
+	if !preview && useGold && hasRepair {
 		ctx.Log.Warn("工坊修理：同型号修理仅支持银币支付", "guid", shortGUID(row.GUID))
 		return nil, false
 	}
 	wholeItemRepair := bodyRepair || (hasPartOrder && allRepairs)
 	if bodyRepair && isReel {
 		// 内部零件都满、只有本体掉耐久：只收本体这一格的钱。
-		bodyWear := math.Max(0, 1-row.Durability)
-		silver += int64(math.Round(bodyWear * 500))
+		silver += workshopPartRepairPrice(row.Durability)
 		gold = 0
 	}
 	costSilver, costGold := silver, gold
-	if !useGold && wholeItemRepair && costSilver == 0 {
+	if !preview && !useGold && wholeItemRepair && costSilver == 0 {
 		// 同型号零件已无需修复时返回持久化的装备快照，不提交零金额交易。
 		// 客户端仍按装备对象解析该响应，不能退回通用空列表。
 		out, err := srv.ItemToTree(cctx, row)
@@ -1479,46 +1511,50 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 		body, err := proto.EncodeValue(out, ctx.Sess.Table())
 		return body, err == nil
 	}
-	if useGold {
-		if costGold <= 0 {
-			ctx.Log.Warn("工坊换件：金币价格为 0，拒绝零金额交易", "item", shortGUID(itemGUID))
-			return nil, false
-		}
-	} else if costSilver <= 0 {
-		ctx.Log.Warn("工坊换件：银币价格为 0，拒绝零金额交易", "item", shortGUID(itemGUID))
-		return nil, false
-	}
-	if clientCost > 0 {
-		quotedCost := costSilver
+	if !preview {
 		if useGold {
-			quotedCost = costGold
-		}
-		if !workshopQuoteMatches(clientCost, quotedCost) {
-			ctx.Log.Warn("工坊换件：客户端报价异常", "item", shortGUID(itemGUID),
-				"client", clientCost, "server", quotedCost, "gold", useGold)
+			if costGold <= 0 {
+				ctx.Log.Warn("工坊换件：金币价格为 0，拒绝零金额交易", "item", shortGUID(itemGUID))
+				return nil, false
+			}
+		} else if costSilver <= 0 {
+			ctx.Log.Warn("工坊换件：银币价格为 0，拒绝零金额交易", "item", shortGUID(itemGUID))
 			return nil, false
 		}
-	}
-	p, perr := srv.DB.EnsureProfile(cctx, ctx.Sess.Userid)
-	if perr != nil {
-		return nil, false
-	}
-	if useGold {
-		if p.Gold < costGold {
-			ctx.Log.Info("工坊换件：金币不足", "balance", p.Gold, "cost", costGold)
+		if clientCost > 0 {
+			quotedCost := costSilver
+			if useGold {
+				quotedCost = costGold
+			}
+			if !workshopQuoteMatches(clientCost, quotedCost) {
+				ctx.Log.Warn("工坊换件：客户端报价异常", "item", shortGUID(itemGUID),
+					"client", clientCost, "server", quotedCost, "gold", useGold)
+				return nil, false
+			}
+		}
+		p, perr := srv.DB.EnsureProfile(cctx, ctx.Sess.Userid)
+		if perr != nil {
 			return nil, false
 		}
-	} else {
-		if p.Silver < costSilver {
-			ctx.Log.Info("工坊换件：银币不足", "balance", p.Silver, "cost", costSilver)
-			return nil, false
+		if useGold {
+			if p.Gold < costGold {
+				ctx.Log.Info("工坊换件：金币不足", "balance", p.Gold, "cost", costGold)
+				return nil, false
+			}
+		} else {
+			if p.Silver < costSilver {
+				ctx.Log.Info("工坊换件：银币不足", "balance", p.Silver, "cost", costSilver)
+				return nil, false
+			}
 		}
 	}
 	// 版本戳必须严格递增，否则客户端会忽略更新后的物品树，工作坊停在转圈状态。
 	if row.WireClass == "cnolibojkao" {
 		srv.appendFactoryPartsToRig(cctx, proto.Obj(row.WireClass, uint32(row.TypeID), fields...))
 	}
-	bumpCreatedTicks(fields, row.WireClass)
+	if !preview {
+		bumpCreatedTicks(fields, row.WireClass)
+	}
 	fj, jerr := FieldsToJSON(fields)
 	if jerr != nil {
 		return nil, false
@@ -1538,6 +1574,7 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 		newDurability = 1.0
 	}
 	var preparedPerf *store.ReelPerformance
+	snapshot.Durability = newDurability
 	if isReel {
 		// 本体那一格是轮内零件的综合：换掉烧穿的摩擦片必须能把它抬回来，
 		// 否则“换件修好”永远修不好。先算好新本体和物理参数，再与扣费、
@@ -1547,11 +1584,20 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 			newDurability = body
 		}
 		snapshot.Durability = newDurability
-		preparedPerf, perr = srv.buildReelPerformance(cctx, &snapshot)
-		if perr != nil {
-			ctx.Log.Warn("工坊换件：轮子物理参数计算失败", "guid", shortGUID(row.GUID), "err", perr)
+		var perfErr error
+		preparedPerf, perfErr = srv.buildReelPerformance(cctx, &snapshot)
+		if perfErr != nil {
+			ctx.Log.Warn("工坊换件：轮子物理参数计算失败", "guid", shortGUID(row.GUID), "err", perfErr)
 			return nil, false
 		}
+	}
+	if preview {
+		out, err := srv.ItemToTree(cctx, &snapshot)
+		if err != nil {
+			return nil, false
+		}
+		body, err := proto.EncodeValue(out, ctx.Sess.Table())
+		return body, err == nil
 	}
 	tx, terr := beginEconomyTx(cctx, srv.DB)
 	if terr != nil {
@@ -1599,11 +1645,13 @@ func hWorkshopOrder(ctx *Ctx) ([]byte, bool) {
 	if berr != nil {
 		return nil, false
 	}
-	// 官方顺序是先回 21/3，再用 4/22 刷新客户端物品缓存。
+	// 先确认，再推更新版本的装备及余额，避免客户端忽略同版本缓存更新。
 	ctx.AfterResponse(func() {
+		bumpCreatedTicks(out.Fields, out.Class)
 		ctx.Sess.Push(4, 22, proto.Args(proto.S("61"), out))
+		ctx.Sess.Push2_1()
 	})
-	ctx.Log.Info("21/3 工坊换件完成", "item", row.ItemID, "guid", shortGUID(row.GUID),
+	ctx.Log.Info("21/4 工坊换件完成", "item", row.ItemID, "guid", shortGUID(row.GUID),
 		"parts", len(orders), "silver", costSilver, "gold", costGold)
 	return bodyOut, true
 }

@@ -364,6 +364,8 @@ func TestWorkshopWornReelDirectReplaceSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 直接更换仍提交已装型号：21/3 可重复，21/4 随后携带确认价格。
+	d := NewDispatch(srv)
+	registerEconMarket(d)
 	for i, sub := range []int{3, 3, 4} {
 		quote := uint64(0)
 		if sub == 4 {
@@ -372,7 +374,7 @@ func TestWorkshopWornReelDirectReplaceSequence(t *testing.T) {
 		c := &Ctx{Sess: newProbeSess(srv), Main: 21, Sub: sub,
 			Tree: snapshotWorkshopRequestPart(reel.GUID, uint32(reelPartCatGear), gearID, quote),
 			Log:  logging.Discard()}
-		body, ok := hWorkshopOrder(c)
+		body, ok := d.lookup(21, uint8(sub))(c)
 		if !ok {
 			t.Fatalf("步骤 %d 的 21/%d 落入兜底", i, sub)
 		}
@@ -389,6 +391,9 @@ func TestWorkshopWornReelDirectReplaceSequence(t *testing.T) {
 		}
 		for _, part := range srv.repairPartsOf(ctx, fresh) {
 			want := 1.0
+			if part.Cat == uint32(reelPartCatGear) && sub == 3 {
+				want = .8
+			}
 			if part.Cat == uint32(reelPartCatWasher) {
 				want = .2
 			}
@@ -408,16 +413,20 @@ func TestWorkshopWornReelDirectReplaceSequence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// 仅首次扣除齿轮修理费 100。
-		if p.Silver != 9900 || p.Gold != 0 {
+		// 预览无副作用，仅最终确认扣除齿轮修理费 100。
+		wantSilver, wantTxns := int64(10000), 0
+		if sub == 4 {
+			wantSilver, wantTxns = 9900, 1
+		}
+		if p.Silver != wantSilver || p.Gold != 0 {
 			t.Fatalf("步骤 %d 余额不正确: silver=%d gold=%d", i, p.Silver, p.Gold)
 		}
 		var count int
 		if err := db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM txn WHERE uid=? AND kind='workshop_part'`, uid).Scan(&count); err != nil {
 			t.Fatal(err)
 		}
-		if count != 1 {
-			t.Fatalf("步骤 %d 交易流水=%d，期望 1", i, count)
+		if count != wantTxns {
+			t.Fatalf("步骤 %d 交易流水=%d，期望 %d", i, count, wantTxns)
 		}
 	}
 }
