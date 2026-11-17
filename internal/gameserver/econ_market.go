@@ -1407,7 +1407,7 @@ func workshopOrder(ctx *Ctx, preview bool) ([]byte, bool) {
 	hasPartOrder := false
 	allRepairs := true
 	for _, o := range orders {
-		if o.Cat == uint32(gearCatReel) &&
+		if isReel && o.Cat == uint32(gearCatReel) &&
 			(o.SysID == "" || strings.EqualFold(o.SysID, row.ItemID)) {
 			if !bodyRepair {
 				bodyRepair = true
@@ -1490,6 +1490,19 @@ func workshopOrder(ctx *Ctx, preview bool) ([]byte, bool) {
 	}
 	if !changed {
 		return nil, false
+	}
+	if bodyRepair {
+		// 本体行只在全部内件完好、仅本体掉耐久时出现。拒绝把本体修理与
+		// 内件订单组合，或在内件仍有磨损时直接恢复整轮耐久。
+		for cat, cond := range conditions {
+			if cat == uint32(gearCatReel) {
+				continue
+			}
+			if hasPartOrder || cond < 1 {
+				ctx.Log.Warn("工坊修理：本体修理与未修内件冲突", "guid", shortGUID(row.GUID))
+				return nil, false
+			}
+		}
 	}
 	if !preview && useGold && hasRepair {
 		ctx.Log.Warn("工坊修理：同型号修理仅支持银币支付", "guid", shortGUID(row.GUID))
