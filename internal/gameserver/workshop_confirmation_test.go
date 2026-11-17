@@ -127,12 +127,13 @@ func TestWorkshopTinyWearRepairAndQuote(t *testing.T) {
 		}
 		jobs := srv.partAlternatives(ctx, reel.ItemID, part)
 		for _, job := range jobs {
-			if *job.Fields[0].Str == partID && job.Fields[2].Val.Fields[0].U64() != 1 {
-				t.Error("same-model order quote must be one cent for tiny wear")
+			if *job.Fields[0].Str == partID && job.Fields[2].Val.Fields[0].U64() != 100 {
+				t.Error("same-model order quote must respect the client's one-silver minimum")
 			}
 		}
 	}
-	c := &Ctx{Sess: newProbeSess(srv), Main: 21, Sub: 4, Tree: snapshotWorkshopRequestPart(reel.GUID, uint32(reelPartCatGear), partID, 1), Log: logging.Discard()}
+	// Actual client 21/4 sends 100 even when the server quotes one cent.
+	c := &Ctx{Sess: newProbeSess(srv), Main: 21, Sub: 4, Tree: snapshotWorkshopRequestPart(reel.GUID, uint32(reelPartCatGear), partID, 100), Log: logging.Discard()}
 	if _, ok := hWorkshopOrder(c); !ok {
 		t.Fatal("tiny wear repair failed")
 	}
@@ -145,14 +146,14 @@ func TestWorkshopTinyWearRepairAndQuote(t *testing.T) {
 		t.Error("repaired part version was not refreshed")
 	}
 	p, _ := db.GetProfile(ctx, 1000001)
-	if p.Silver != 9999 {
-		t.Errorf("balance=%d want 9999", p.Silver)
+	if p.Silver != 9900 {
+		t.Errorf("balance=%d want 9900", p.Silver)
 	}
 	if _, ok := hWorkshopOrder(c); !ok {
 		t.Fatal("repeat failed")
 	}
 	p, _ = db.GetProfile(ctx, 1000001)
-	if p.Silver != 9999 {
+	if p.Silver != 9900 {
 		t.Fatal("repeat charged again")
 	}
 }

@@ -1246,12 +1246,13 @@ func workshopSlots(ctx context.Context, srv *Server, guid string) []uint32 {
 	return out
 }
 
-// workshopPartRepairPrice 以分计费；非零磨损不能取整成“无需修理”。
+// workshopPartRepairPrice 以分计费。客户端对有磨损部件的确认报价最低
+// 为 1 银币（100 分）；低于该值会出现预览正常、21/4 报价校验失败。
 func workshopPartRepairPrice(condition float64) int64 {
 	if condition >= 1 {
 		return 0
 	}
-	return int64(math.Max(1, math.Round(math.Max(0, 1-condition)*500)))
+	return int64(math.Max(100, math.Round(math.Max(0, 1-condition)*500)))
 }
 
 // hWorkshopDiag 处理 21/2，返回 503 物品诊断：
