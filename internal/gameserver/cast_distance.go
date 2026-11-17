@@ -22,7 +22,7 @@ import (
 //     它来自对「49g 竿封顶 50」的误读，那句话指的是竿的 Test 上限约 50g，
 //     不是抛投米数。这里只当内部回归基线用，挡住曲线中段漂移。
 //
-// 由此反解得截距 23.06、路亚指数 0.41（见 specs/changes/cast-rod-test-scaling）。
+// 由此反解得截距 23.06、路亚指数 0.464（见 specs/changes/cast-rod-test-scaling）。
 // 指数同时受「同族内距离必须随 Test 单调、且两端不失控」约束；中重装档的官服
 // 实测值补齐后，必须用真实锚点重解指数并同步回归基线。
 //
@@ -51,9 +51,13 @@ const (
 var (
 	// castNominalLureM 是锚点档（castNominalTestAnchorG）的标称距离。
 	castNominalLureM = 23.06
-	// castNominalTestExp 是路亚族标称随 Test 上限放大的指数，由 Test 49g
-	// 锚点反解。
-	castNominalTestExp = 0.41
+	// castNominalTestExp 是路亚族标称随 Test 上限放大的指数。
+	//
+	// 由两条官服锚点同时反解：Test 4g（UL，2m 竿 + 3.53g 拟饵 + 水滴轮 +
+	// 0.24 编织线 + 满熟练满技能）实测 27.0m，与 Test 70g（S-M100HH 3m 竿 +
+	// Turion 8000 + 22g 拟饵 + 60kg 编织线 + 满熟练满技能）实测 69.3m。
+	// 截距已被 UL 锚点锁死为 castNominalLureM，所以指数是唯一自由变量。
+	castNominalTestExp = 0.464
 	// castNominalDefaultTestExp 是非路亚族（手竿/浮钓/底钓/鲤鱼竿）的指数。
 	// 德语官服论坛 topic 2219 同帖有四条重装实测（95 / 105-110 / 115 / 135 /
 	// 146m，配置差异主要在竿与轮），逐条反解得到 0.265~0.326 的区间；取中位
