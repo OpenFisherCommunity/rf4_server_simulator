@@ -903,7 +903,7 @@ func (s *Server) reloadBaitForCast(ctx context.Context, uid int64, rod string) (
 					break
 				}
 			}
-			if rigType == rigMarineBottomClassic {
+			if hasFixedMarineBaitSlots(rigType) {
 				// 固定饵位不能按剩余件数追加：仅剩 351 时补第一钩会覆盖它。
 				if targetHook.Extra == 250 || targetHook.Extra == 251 {
 					mountOrdinal = targetHook.Extra - 250
@@ -956,7 +956,7 @@ func (s *Server) reloadBaitForCast(ctx context.Context, uid int64, rod string) (
 				if err := s.DB.UpsertRodSetting(ctx, rod, "bait_hook:"+result.MountedGUID, request.HookGUID); err != nil {
 					return out, err
 				}
-				if multi && rigType != rigMarineBottomClassic {
+				if multi && !hasFixedMarineBaitSlots(rigType) {
 					if err := s.orderBaitsByHook(ctx, uid, rod); err != nil {
 						return out, err
 					}
