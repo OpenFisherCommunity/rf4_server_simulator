@@ -206,9 +206,16 @@ var canonicalRigIndex = func() map[int64]int64 {
 	return m
 }()
 
+const rigMarineBottomClassic = 55
+
+// 单钩双饵和海洋底部双支线都显式区分 350/351。其他多钩钓组仍按钩饵映射。
+func hasIndexedBaitPair(rigType int64) bool {
+	return rigType == rigMarineBottomClassic || len(slotIndicesFor(rigType, catHook)) <= 1
+}
+
 // slotIndicesFor 返回指定钓组类型和品类对应的规范索引列表。
 func slotIndicesFor(rigType, category int64) []int64 {
-	if category == 27 && rigType != 0 && len(slotIndicesFor(rigType, catHook)) <= 1 {
+	if category == 27 && rigType != 0 && hasIndexedBaitPair(rigType) {
 		return []int64{350, 351}
 	}
 	tpl := rigSlotTemplates[rigType]
@@ -464,7 +471,7 @@ func canonicalIndex(category, clientIndex int64, rigType int64) int64 {
 // 合法客户端索引优先，否则使用模板中对应序号的槽。
 func canonicalIndexForOrdinal(category, clientIndex, rigType, ordinal int64) int64 {
 	if category == 27 {
-		if ordinal == 1 && len(slotIndicesFor(rigType, catHook)) <= 1 {
+		if ordinal == 1 && hasIndexedBaitPair(rigType) {
 			return 351
 		}
 		return 350
@@ -526,7 +533,7 @@ func rigCompsOf(f5 *proto.Value) map[int64]rigComp {
 		return out
 	}
 	_, rigType, _ := rigIdentity(f5)
-	singleHook := len(slotIndicesFor(rigType, catHook)) <= 1
+	indexedBaits := hasIndexedBaitPair(rigType)
 	counts := map[int64]int64{}
 	for _, it := range comps.Items {
 		if it == nil || it.Kind != proto.KindObj {
@@ -539,7 +546,7 @@ func rigCompsOf(f5 *proto.Value) map[int64]rigComp {
 		}
 		cat := int64(f0.U32())
 		ordinal := counts[cat]
-		if cat == 27 && singleHook {
+		if cat == catBait && indexedBaits {
 			switch f2.U32() {
 			case 351:
 				ordinal = 1
