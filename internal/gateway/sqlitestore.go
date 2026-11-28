@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"rf4server/internal/store"
@@ -54,19 +55,42 @@ func (s *SQLiteStore) LookupToken(ctx context.Context, token string) (TokenInfo,
 }
 
 // lookupByPrefix 前缀匹配（token 以 logintoken 开头）。
+//
+// 入口先拒绝客户端输入里的 LIKE 通配符；查询层再用 substr 做字面前缀比较。
+// 两层独立防线各自都有测试：LIKE 会把 % 和 _ 当成通配符，于是 %|%|1000001|%
+// 这类伪造串能命中任意已签发记录、冒用他人 uid。
 func (s *SQLiteStore) lookupByPrefix(ctx context.Context, prefix string) (TokenInfo, bool, error) {
-	if len(prefix) < 8 {
+	if len(prefix) < 8 || hasTokenWildcard(prefix) {
 		return TokenInfo{}, false, nil
 	}
+	return s.lookupByLiteralPrefix(ctx, prefix)
+}
+
+// lookupByLiteralPrefix 执行前缀查询本身，调用方负责先做入口校验。
+// 单独拆出查询层是为了让测试能在入口 guard 开启时直接锁定 SQL 语义：
+// 若这里退回 LIKE ?||'%'，含 % 或 _ 的伪造前缀会重新命中任意已签发记录。
+func (s *SQLiteStore) lookupByLiteralPrefix(ctx context.Context, prefix string) (TokenInfo, bool, error) {
 	var infoJSON string
 	var expiresF float64
 	err := s.DB.SQL.QueryRowContext(ctx,
-		`SELECT info_json, expires FROM gw_token WHERE token LIKE ?||'%' AND length(token)>? ORDER BY expires DESC LIMIT 1`,
-		prefix, len(prefix)).Scan(&infoJSON, &expiresF)
+		`SELECT info_json, expires FROM gw_token WHERE substr(token,1,?)=? AND length(token)>? ORDER BY expires DESC LIMIT 1`,
+		len(prefix), prefix, len(prefix)).Scan(&infoJSON, &expiresF)
 	if err != nil {
-		return TokenInfo{}, false, nil // 无前缀命中
+		if errors.Is(err, sql.ErrNoRows) {
+			return TokenInfo{}, false, nil // 无前缀命中
+		}
+		// 读库真出错必须报出去：realtime 靠 err 区分「查询异常」与「未登记」。
+		return TokenInfo{}, false, err
 	}
 	return decodeTokenInfo(infoJSON, expiresF)
+}
+
+// hasTokenWildcard 报告凭据里是否含 LIKE 通配符 % _ 或转义符 \。
+//
+// 真实凭据的字符集只有 hex 的 0-9a-f、base64 的 A-Za-z0-9+/ 与分隔符 '|'，
+// 不含这三个字符，因此拒绝它们不会挡住任何合法客户端。
+func hasTokenWildcard(token string) bool {
+	return strings.ContainsAny(token, "%_\\")
 }
 
 func decodeTokenInfo(infoJSON string, expires float64) (TokenInfo, bool, error) {
@@ -118,42 +142,34 @@ func (s *SQLiteStore) DeleteHandoff(ctx context.Context, token string) error {
 	return err
 }
 
+// useridSeqKey 共享 userid 计数器在 kv 表中的键。
+const useridSeqKey = "userid_seq"
+
+// NextUserid 分配下一个全局 userid（登录签发用）。
+//
+// 取当前值与写回新值必须是同一条语句：先读后写会让并发调用读到同一个旧值，
+// 两名玩家拿到同一个 userid，进而共用一份档案与背包。这里用 UPSERT 自增，
+// 写事务由 SQLite 串行化，分配结果直接取自 RETURNING。
 func (s *SQLiteStore) NextUserid(ctx context.Context) (int64, error) {
-	// 共享 KV 计数器：单机多进程安全（WAL + busy_timeout 串行写）
-	const key = "userid_seq"
-	var cur int64
-	if v, ok, err := s.DB.KVGet(ctx, key); err == nil && ok {
-		_, _ = fmtSscan(v, &cur)
+	var next int64
+	err := s.DB.SQL.QueryRowContext(ctx, `
+		INSERT INTO kv(k, v) VALUES(?, '1')
+		ON CONFLICT (k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)
+		WHERE v GLOB '[0-9]*' AND v NOT GLOB '*[^0-9]*'
+		RETURNING CAST(v AS INTEGER)`, useridSeqKey).Scan(&next)
+	if errors.Is(err, sql.ErrNoRows) {
+		// 既有值不是十进制整数时不执行自增：CAST 会把异常值当成 0，写回即把
+		// 计数器重置回 1，新账号会与既有玩家撞号。这种情况报错并保留原值。
+		if v, ok, gerr := s.DB.KVGet(ctx, useridSeqKey); gerr == nil && ok {
+			return 0, fmt.Errorf("userid 计数器 %q 不是十进制整数，拒绝重置", v)
+		}
 	}
-	next := cur + 1
-	if err := s.DB.KVSet(ctx, key, int64ToStr(next)); err != nil {
-		return 0, err
+	if err != nil {
+		// 读库真出错必须报出去：当成「没有计数器」会静默把序号打回 1。
+		return 0, fmt.Errorf("分配 userid 序号: %w", err)
+	}
+	if next <= 0 {
+		return 0, fmt.Errorf("分配 userid 序号: 得到非法值 %d", next)
 	}
 	return next, nil
-}
-
-func fmtSscan(s string, out *int64) (int, error) {
-	return fmt.Sscanf(s, "%d", out)
-}
-
-func int64ToStr(v int64) string {
-	if v == 0 {
-		return "0"
-	}
-	neg := v < 0
-	if neg {
-		v = -v
-	}
-	var buf [20]byte
-	i := len(buf)
-	for v > 0 {
-		i--
-		buf[i] = byte('0' + v%10)
-		v /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

@@ -50,6 +50,9 @@ type Server struct {
 
 	// 可选图标包按 Server 实例缓存；缺包或坏包保持 404 降级。
 	icons iconArchive
+
+	// 内嵌前端根；handleIndexPage 用它渲染语言页面壳（i18n）。
+	webFS fs.FS
 }
 
 type plog struct{ l logger }
@@ -65,7 +68,7 @@ const releaseNotesFilename = "发布说明.md"
 // NewServer 构建管理后台（webFS 为内嵌前端，nil 时只有 API）。
 // 运行时指令写入共享 SQLite 队列，由 gameserver 轮询消费。
 func NewServer(cfg config.Admin, db *store.DB, log logger, webFS fs.FS) *Server {
-	s := &Server{cfg: cfg, db: db, log: &plog{l: log}, jwtKey: []byte(cfg.JWTSecret)}
+	s := &Server{cfg: cfg, db: db, log: &plog{l: log}, jwtKey: []byte(cfg.JWTSecret), webFS: webFS}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 
@@ -73,9 +76,10 @@ func NewServer(cfg config.Admin, db *store.DB, log logger, webFS fs.FS) *Server 
 		return s.withAuth(h)
 	}
 	mux.HandleFunc("GET /api/me", auth(s.handleMe))
-	mux.HandleFunc("GET /api/dashboard", auth(s.handleDashboard))
-	mux.HandleFunc("GET /api/tunables", auth(s.handleTunableList))
+	mux.HandleFunc("GET /api/dashboard", s.withOptionalAuth(s.handleDashboard)) // 匿名只给健康状态，登录后才给运行态统计
+	mux.HandleFunc("GET /api/tunables", s.handleTunableList)                    // 匿名只读：不登录也能看
 	mux.HandleFunc("POST /api/tunables", auth(s.handleTunableSet))
+	mux.HandleFunc("POST /api/skill_gain_mode", auth(s.handleSkillGainModeSet))
 	mux.HandleFunc("POST /api/fish_tv_test", auth(s.handleFishTVTest))
 	mux.HandleFunc("GET /api/players", auth(s.handlePlayers))
 	mux.HandleFunc("GET /api/players/detail", auth(s.handlePlayerDetail))
@@ -92,38 +96,38 @@ func NewServer(cfg config.Admin, db *store.DB, log logger, webFS fs.FS) *Server 
 	mux.HandleFunc("POST /api/players/skills/points", auth(s.handlePlayerSkillPoints))
 	mux.HandleFunc("POST /api/players/kick", auth(s.handleKick))
 	mux.HandleFunc("POST /api/players/ban", auth(s.handleBan))
-	mux.HandleFunc("GET /api/catalog/items", auth(s.handleCatalogItems))
-	mux.HandleFunc("GET /api/catalog/groups", auth(s.handleCatalogGroups))
-	mux.HandleFunc("GET /api/stores", auth(s.handleStores))
-	mux.HandleFunc("GET /api/stores/items", auth(s.handleStoreItems))
+	mux.HandleFunc("GET /api/catalog/items", s.handleCatalogItems)   // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/catalog/groups", s.handleCatalogGroups) // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/stores", s.handleStores)                // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/stores/items", s.handleStoreItems)      // 匿名只读：不登录也能看
 	mux.HandleFunc("POST /api/stores/items/update", auth(s.handleStoreItemUpdate))
 	mux.HandleFunc("POST /api/stores/items/reset", auth(s.handleStoreItemReset))
-	mux.HandleFunc("GET /api/fish/areas", auth(s.handleFishAreas))
-	mux.HandleFunc("GET /api/fish/config", auth(s.handleFishConfig))
+	mux.HandleFunc("GET /api/fish/areas", s.handleFishAreas)   // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/fish/config", s.handleFishConfig) // 匿名只读：不登录也能看
 	mux.HandleFunc("POST /api/fish/config", auth(s.handleFishConfigSave))
 	mux.HandleFunc("POST /api/fish/config/reset", auth(s.handleFishConfigReset))
-	mux.HandleFunc("GET /api/fish/pool", auth(s.handleFishPool))
-	mux.HandleFunc("GET /api/fish/spawn_mode", auth(s.handleSpawnModeGet))
+	mux.HandleFunc("GET /api/fish/pool", s.handleFishPool)           // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/fish/spawn_mode", s.handleSpawnModeGet) // 匿名只读：不登录也能看
 	mux.HandleFunc("POST /api/fish/spawn_mode", auth(s.handleSpawnModeSet))
-	mux.HandleFunc("GET /api/fish/bite_mode", auth(s.handleBiteModeGet))
+	mux.HandleFunc("GET /api/fish/bite_mode", s.handleBiteModeGet) // 匿名只读：不登录也能看
 	mux.HandleFunc("POST /api/fish/bite_mode", auth(s.handleBiteModeSet))
-	mux.HandleFunc("GET /api/hooks/profiles", auth(s.handleHookProfiles))
+	mux.HandleFunc("GET /api/hooks/profiles", s.handleHookProfiles) // 匿名只读：不登录也能看
 	mux.HandleFunc("POST /api/hooks/profiles", auth(s.handleHookProfileSave))
-	mux.HandleFunc("GET /api/bait/prefs", auth(s.handleBaitPrefs))
-	mux.HandleFunc("GET /api/bait/items", auth(s.handleBaitItems))
-	mux.HandleFunc("GET /api/bait/categories", auth(s.handleBaitCategories))
+	mux.HandleFunc("GET /api/bait/prefs", s.handleBaitPrefs)           // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/bait/items", s.handleBaitItems)           // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/bait/categories", s.handleBaitCategories) // 匿名只读：不登录也能看
 	mux.HandleFunc("PUT /api/bait/rules", auth(s.handleBaitRuleSave))
 	mux.HandleFunc("POST /api/bait/rules/reset", auth(s.handleBaitRuleReset))
-	mux.HandleFunc("GET /api/fish/sea-now", auth(s.handleFishSeaNow))
-	mux.HandleFunc("GET /api/fish/sea-zone-latest", auth(s.handleFishSeaZoneLatest))
-	mux.HandleFunc("GET /api/fish/sea-zones", auth(s.handleFishSeaZones))
-	mux.HandleFunc("GET /api/fish/zones", auth(s.handleFishZones))
+	mux.HandleFunc("GET /api/fish/sea-now", s.handleFishSeaNow)                // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/fish/sea-zone-latest", s.handleFishSeaZoneLatest) // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/fish/sea-zones", s.handleFishSeaZones)            // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/fish/zones", s.handleFishZones)                   // 匿名只读：不登录也能看
 	mux.HandleFunc("POST /api/fish/zones", auth(s.handleFishZoneSave))
 	mux.HandleFunc("POST /api/fish/zones/delete", auth(s.handleFishZoneDelete))
 	mux.HandleFunc("POST /api/mail/send", auth(s.handleMailSend))
-	mux.HandleFunc("GET /api/audit", auth(s.handleAudit))
-	mux.HandleFunc("GET /api/about", auth(s.handleAbout))
-	mux.HandleFunc("GET /api/release-notes", auth(s.handleReleaseNotes))
+	mux.HandleFunc("GET /api/audit", auth(s.handleAudit))          // 含管理员账号与操作明细，必须登录
+	mux.HandleFunc("GET /api/about", s.handleAbout)                // 匿名只读：不登录也能看
+	mux.HandleFunc("GET /api/release-notes", s.handleReleaseNotes) // 匿名只读：不登录也能看
 
 	// 纸地图贴图运行时加载（素材不入仓库，见 paper_maps.go）：
 	// 先于 SPA FileServer 注册，web/ 内已不再内嵌 maps 目录。
@@ -131,6 +135,9 @@ func NewServer(cfg config.Admin, db *store.DB, log logger, webFS fs.FS) *Server 
 	// 物品与鱼种图标同理由 ref/ 运行时加载（见 item_icons.go）。
 	mux.Handle("GET /icons/", http.HandlerFunc(s.handleIcons))
 	if webFS != nil {
+		// 页面壳按语言改写（?lang= / cookie lang / Accept-Language），其余静态资源照旧。
+		mux.HandleFunc("GET /{$}", s.handleIndexPage)
+		mux.HandleFunc("GET /index.html", s.handleIndexPage)
 		mux.Handle("/", http.FileServer(http.FS(webFS)))
 	}
 	s.mux = mux
@@ -216,7 +223,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 401, "用户名或密码错误")
 		return
 	}
-	_ = s.db.AuditLogWrite(r.Context(), req.Username, "login", "", "")
+	if err := s.db.AuditLogWrite(r.Context(), req.Username, "login", "", ""); err != nil {
+		s.log.l.Error("登录审计写入失败", "admin", req.Username, "err", err)
+	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims{
 		Username: req.Username,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -233,21 +242,45 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		authz := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authz, "Bearer ") {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			httpError(w, 401, "未认证")
 			return
 		}
-		tok, err := jwt.ParseWithClaims(strings.TrimPrefix(authz, "Bearer "), &claims{},
-			func(t *jwt.Token) (any, error) { return s.jwtKey, nil })
-		if err != nil || !tok.Valid {
+		username := s.parseAdmin(r.Header.Get("Authorization"))
+		if username == "" {
 			httpError(w, 401, "会话过期")
 			return
 		}
-		cl := tok.Claims.(*claims)
-		r = r.WithContext(context.WithValue(r.Context(), ctxAdmin{}, cl.Username))
+		h(w, r.WithContext(context.WithValue(r.Context(), ctxAdmin{}, username)))
+	}
+}
+
+// withOptionalAuth 只解析可选令牌：有效时按管理员处理，缺失或失效时按匿名继续。
+// 用于既对匿名开放、又要按登录态裁剪响应字段的只读接口。
+func (s *Server) withOptionalAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if username := s.parseAdmin(r.Header.Get("Authorization")); username != "" {
+			r = r.WithContext(context.WithValue(r.Context(), ctxAdmin{}, username))
+		}
 		h(w, r)
 	}
+}
+
+// parseAdmin 校验 Authorization 头里的 JWT 并返回管理员名；缺失或无效返回空串。
+func (s *Server) parseAdmin(authz string) string {
+	if !strings.HasPrefix(authz, "Bearer ") {
+		return ""
+	}
+	tok, err := jwt.ParseWithClaims(strings.TrimPrefix(authz, "Bearer "), &claims{},
+		func(t *jwt.Token) (any, error) { return s.jwtKey, nil })
+	if err != nil || !tok.Valid {
+		return ""
+	}
+	cl, ok := tok.Claims.(*claims)
+	if !ok || cl == nil {
+		return ""
+	}
+	return cl.Username
 }
 
 type ctxAdmin struct{}
@@ -268,6 +301,17 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 // ---- 仪表盘 ----
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	// 默认口令/默认签名密钥的告警在总览页直接可见，不必翻日志；匿名请求也需要看到。
+	payload := map[string]any{"pg": "up", "warnings": s.cfg.WeakWarnings()}
+	if u := s.updatePayload(); u != nil {
+		payload["update"] = u
+	}
+	// 匿名只报告数据库可用；角色数、物品数、邮件数与审计条数属于运行态数据，
+	// 只随已登录的会话下发。
+	if adminOf(r) == "" {
+		writeJSON(w, payload)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var players, items, mails, audits int64
@@ -276,18 +320,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM mail`).Scan(&mails)
 	_ = s.db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log`).Scan(&audits)
 	tunables, _ := s.db.TunableList(ctx)
-	payload := map[string]any{
-		"sessions": s.sessionCount.Load(),
-		"players":  players,
-		"items":    items,
-		"mails":    mails,
-		"audits":   audits,
-		"tunables": len(tunables),
-		"pg":       "up",
-	}
-	if u := s.updatePayload(); u != nil {
-		payload["update"] = u
-	}
+	payload["sessions"] = s.sessionCount.Load()
+	payload["players"] = players
+	payload["items"] = items
+	payload["mails"] = mails
+	payload["audits"] = audits
+	payload["tunables"] = len(tunables)
 	writeJSON(w, payload)
 }
 
@@ -348,8 +386,8 @@ func validateEventStageGifts(value string) error {
 		}
 		for stage, gifts := range stages {
 			s, err := strconv.Atoi(stage)
-			if err != nil || s < 1 || s > gameserver.EventStageCount(int64(n)) {
-				return fmt.Errorf("活动分支 %d 的阶段只能是 1~%d", n, gameserver.EventStageCount(int64(n)))
+			if err != nil || s < 0 || s > gameserver.EventStageCount(int64(n)) {
+				return fmt.Errorf("活动分支 %d 的阶段只能是 0~%d（0 表示全部完成）", n, gameserver.EventStageCount(int64(n)))
 			}
 			if len(gifts) == 0 {
 				return fmt.Errorf("阶段奖励 %s/%s 至少要有一件物品", branch, stage)
@@ -445,7 +483,7 @@ func (s *Server) handleTunableSet(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, "参数错误")
 		return
 	}
-	if (req.Key == "fish_ecology_enabled" || req.Key == "fish_bait_rules_enabled" || req.Key == "fish_distribution_enabled" || req.Key == "fish_weather_enabled" || req.Key == "happy_hour_enabled" || req.Key == "grade_ratio_enabled" || req.Key == "fish_hunt_enabled" || req.Key == "two_stage_hunt_enabled" || req.Key == "hook_nibble_enabled" || req.Key == "event_anniversary_enabled" || req.Key == "event_newyear_enabled" || req.Key == "condition_health_enabled" || req.Key == "condition_fishing_pause_enabled") && req.Value != "0" && req.Value != "1" {
+	if (req.Key == "fish_ecology_enabled" || req.Key == "fish_bait_rules_enabled" || req.Key == "fish_distribution_enabled" || req.Key == "fish_weather_enabled" || req.Key == "marine_layer_enabled" || req.Key == "happy_hour_enabled" || req.Key == "grade_ratio_enabled" || req.Key == "fish_hunt_enabled" || req.Key == "two_stage_hunt_enabled" || req.Key == "hook_nibble_enabled" || req.Key == "event_anniversary_enabled" || req.Key == "event_newyear_enabled" || req.Key == "condition_health_enabled" || req.Key == "condition_fishing_pause_enabled" || req.Key == "bite_pace_enabled") && req.Value != "0" && req.Value != "1" {
 		httpError(w, 400, "开关只能为 0 或 1")
 		return
 	}
@@ -460,6 +498,50 @@ func (s *Server) handleTunableSet(w http.ResponseWriter, r *http.Request) {
 		v, err := strconv.ParseFloat(req.Value, 64)
 		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
 			httpError(w, 400, "鱼获档位权重必须是非负数字")
+			return
+		}
+	}
+	if strings.HasPrefix(req.Key, "skill_grade_mult_") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(req.Value), 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 20 {
+			httpError(w, 400, "鱼获档位熟练度倍数必须在 0 ~ 20 之间")
+			return
+		}
+	}
+	if strings.HasPrefix(req.Key, "bite_off_") {
+		switch req.Key {
+		case "bite_off_enabled":
+			if req.Value != "0" && req.Value != "1" {
+				httpError(w, 400, "咬断线组开关只能为 0 或 1")
+				return
+			}
+		case "bite_off_species":
+			// 空串表示整层关闭；其余按逗号分隔的鱼种 key 存，不做白名单校验
+			// （越界 key 只会在运行时永不命中，不影响其他鱼种）。
+		default:
+			v, err := strconv.ParseFloat(strings.TrimSpace(req.Value), 64)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+				httpError(w, 400, "咬断线组参数必须是非负数字")
+				return
+			}
+			switch req.Key {
+			case "bite_off_over_pct", "bite_off_under_pct":
+				if v > 100 {
+					httpError(w, 400, "咬断概率必须在 0 ~ 100 之间")
+					return
+				}
+			case "bite_off_sprint_seconds":
+				if v < 1 || v > 120 {
+					httpError(w, 400, "冲刺判定间隔必须在 1 ~ 120 秒之间")
+					return
+				}
+			}
+		}
+	}
+	if strings.HasPrefix(req.Key, "skill_gain_pct_") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(req.Value), 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
+			httpError(w, 400, "技能升级概率必须在 0 ~ 100 之间（0=原版）")
 			return
 		}
 	}
@@ -502,7 +584,9 @@ func (s *Server) handleTunableSet(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, err.Error())
 		return
 	}
-	_ = s.db.AuditLogWrite(r.Context(), adminOf(r), "tunable", req.Key, req.Value)
+	aw := adminWrite{admin: adminOf(r)}
+	aw.markBusinessApplied()
+	aw.audit("tunable", req.Key, req.Value)
 	// 两个限时活动互斥：开启任一个自动关闭另一个。5012 同时出现阶段 5/6 时
 	// 客户端只显示新年入口，周年面板会变成不可达。
 	if req.Value == "1" {
@@ -511,11 +595,14 @@ func (s *Server) handleTunableSet(w http.ResponseWriter, r *http.Request) {
 				httpError(w, 500, err.Error())
 				return
 			}
-			_ = s.db.AuditLogWrite(r.Context(), adminOf(r), "tunable", peer, "0")
+			aw.audit("tunable", peer, "0")
 		}
 	}
 	// 通知主服立即刷新运行参数；后台也会按缓存周期生效。
-	_ = s.db.QueuePush(r.Context(), mustJSON(map[string]any{"op": "reload_tunables"}))
+	aw.push(mustJSON(map[string]any{"op": "reload_tunables"}))
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -537,7 +624,7 @@ func spawnModeFor(t map[string]string) string {
 }
 
 // handleBiteModeGet/Set 鱼汛模式二选一（legacy/realistic），
-// 原子统管硬性门/生态/天气/吃饵/分布五个开关；mixed 表示手动改过单个开关。
+// 原子统管硬性门/生态/天气/吃饵/分布/海钓水层六个开关；mixed 表示手动改过单个开关。
 func (s *Server) handleBiteModeGet(w http.ResponseWriter, r *http.Request) {
 	t, err := s.db.TunableList(r.Context())
 	if err != nil {
@@ -563,8 +650,13 @@ func (s *Server) handleBiteModeSet(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, err.Error())
 		return
 	}
-	_ = s.db.AuditLogWrite(r.Context(), adminOf(r), "bite_mode", "mode", req.Mode)
-	_ = s.db.QueuePush(r.Context(), mustJSON(map[string]any{"op": "reload_tunables"}))
+	aw := adminWrite{admin: adminOf(r)}
+	aw.markBusinessApplied()
+	aw.audit("bite_mode", "mode", req.Mode)
+	aw.push(mustJSON(map[string]any{"op": "reload_tunables"}))
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true, "mode": req.Mode})
 }
 
@@ -595,32 +687,67 @@ func (s *Server) handleSpawnModeSet(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, err.Error())
 		return
 	}
-	_ = s.db.AuditLogWrite(r.Context(), adminOf(r), "spawn_mode", "mode", req.Mode)
+	aw := adminWrite{admin: adminOf(r)}
+	aw.markBusinessApplied()
+	aw.audit("spawn_mode", "mode", req.Mode)
 	// 通知主服立即刷新运行参数；后台也会按缓存周期生效。
-	_ = s.db.QueuePush(r.Context(), mustJSON(map[string]any{"op": "reload_tunables"}))
+	aw.push(mustJSON(map[string]any{"op": "reload_tunables"}))
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "mode": req.Mode})
+}
+
+// handleSkillGainModeSet 原子切换八类技能的升级概率模式。
+func (s *Server) handleSkillGainModeSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		httpError(w, 400, "参数错误")
+		return
+	}
+	switch req.Mode {
+	case "native", "fixed100", "custom":
+	default:
+		httpError(w, 400, "技能升级概率模式只能是 native、fixed100 或 custom")
+		return
+	}
+	if err := s.db.SkillGainModeSet(r.Context(), req.Mode, adminOf(r)); err != nil {
+		httpError(w, 500, err.Error())
+		return
+	}
+	aw := adminWrite{admin: adminOf(r)}
+	aw.markBusinessApplied()
+	aw.audit("skill_gain_mode", "mode", req.Mode)
+	aw.push(mustJSON(map[string]any{"op": "reload_tunables"}))
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true, "mode": req.Mode})
 }
 
 // ---- 玩家管理 ----
 
 type playerRow struct {
-	UID     int64   `json:"uid"`
-	Name    string  `json:"name"`
-	Level   int64   `json:"level"`
-	XP      int64   `json:"xp"`
-	Silver  int64   `json:"silver"`
-	Gold    int64   `json:"gold"`
-	Bank    int64   `json:"bank"`
-	Banned  bool    `json:"banned"`
-	Online  bool    `json:"online"`
-	Updated float64 `json:"updated_ts"`
+	UID         int64   `json:"uid"`
+	Name        string  `json:"name"`
+	Level       int64   `json:"level"`
+	XP          int64   `json:"xp"`
+	Silver      int64   `json:"silver"`
+	Gold        int64   `json:"gold"`
+	Bank        int64   `json:"bank"`
+	Banned      bool    `json:"banned"`
+	Online      bool    `json:"online"`
+	OnlineKnown bool    `json:"online_known"`
+	Updated     float64 `json:"updated_ts"`
 }
 
 func (s *Server) handlePlayers(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	var rows []playerRow
+	rows := make([]playerRow, 0)
 	var err error
 	if q == "" {
 		err = queryPlayers(ctx, s.db, &rows,
@@ -636,6 +763,7 @@ func (s *Server) handlePlayers(w http.ResponseWriter, r *http.Request) {
 	online := s.onlineUIDs(ctx)
 	for i := range rows {
 		rows[i].Online = online[rows[i].UID]
+		rows[i].OnlineKnown = online != nil
 	}
 	writeJSON(w, rows)
 }
@@ -786,8 +914,13 @@ func (s *Server) handlePlayerUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail, _ := json.Marshal(req)
-	_ = s.db.AuditLogWrite(ctx, adminOf(r), "player_update", strconv.FormatInt(req.UID, 10), string(detail))
-	_ = s.db.QueuePush(ctx, mustJSON(map[string]any{"op": "refresh_player", "uid": req.UID}))
+	aw := adminWrite{admin: adminOf(r)}
+	aw.markBusinessApplied()
+	aw.audit("player_update", strconv.FormatInt(req.UID, 10), string(detail))
+	aw.push(mustJSON(map[string]any{"op": "refresh_player", "uid": req.UID}))
+	if !s.commitAdmin(ctx, w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -809,11 +942,14 @@ func (s *Server) handleGrantItem(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, err.Error())
 		return
 	}
-	_ = s.db.QueuePush(r.Context(), mustJSON(map[string]any{
+	aw := adminWrite{admin: adminOf(r)}
+	aw.push(mustJSON(map[string]any{
 		"op": "grant_item", "uid": req.UID, "item_id": req.ItemID, "qty": req.Qty,
 	}))
-	_ = s.db.AuditLogWrite(r.Context(), adminOf(r), "grant_item",
-		strconv.FormatInt(req.UID, 10), fmt.Sprintf("%s x%d", req.ItemID, req.Qty))
+	aw.audit("grant_item", strconv.FormatInt(req.UID, 10), fmt.Sprintf("%s x%d", req.ItemID, req.Qty))
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -841,11 +977,15 @@ func (s *Server) handleFishTVTest(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, "kind 取值 -36..36")
 		return
 	}
-	_ = s.db.QueuePush(r.Context(), mustJSON(map[string]any{
+	aw := adminWrite{admin: adminOf(r)}
+	aw.push(mustJSON(map[string]any{
 		"op": "fish_tv_test", "uid": req.UID, "channel": req.Channel, "kind": req.Kind,
 		"kv_shape": req.KVShape, "species": req.Species, "weight_g": req.WeightG,
 		"text": req.Text,
 	}))
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 func (s *Server) handleKick(w http.ResponseWriter, r *http.Request) {
@@ -856,8 +996,12 @@ func (s *Server) handleKick(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, "参数错误")
 		return
 	}
-	_ = s.db.QueuePush(r.Context(), mustJSON(map[string]any{"op": "kick", "uid": req.UID}))
-	_ = s.db.AuditLogWrite(r.Context(), adminOf(r), "kick", strconv.FormatInt(req.UID, 10), "")
+	aw := adminWrite{admin: adminOf(r)}
+	aw.push(mustJSON(map[string]any{"op": "kick", "uid": req.UID}))
+	aw.audit("kick", strconv.FormatInt(req.UID, 10), "")
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -874,12 +1018,17 @@ func (s *Server) handleBan(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, err.Error())
 		return
 	}
+	aw := adminWrite{admin: adminOf(r)}
+	aw.markBusinessApplied()
 	action := "unban"
 	if req.Banned {
 		action = "ban"
-		_ = s.db.QueuePush(r.Context(), mustJSON(map[string]any{"op": "kick", "uid": req.UID}))
+		aw.push(mustJSON(map[string]any{"op": "kick", "uid": req.UID}))
 	}
-	_ = s.db.AuditLogWrite(r.Context(), adminOf(r), action, strconv.FormatInt(req.UID, 10), "")
+	aw.audit(action, strconv.FormatInt(req.UID, 10), "")
+	if !s.commitAdmin(r.Context(), w, aw) {
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -984,6 +1133,9 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpError(w, 500, err.Error())
 		return
+	}
+	if entries == nil {
+		entries = make([]*store.AuditEntry, 0)
 	}
 	writeJSON(w, entries)
 }

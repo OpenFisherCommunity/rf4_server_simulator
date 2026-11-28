@@ -87,6 +87,7 @@ func applyPersistedFishingState(st *FishState, saved *store.FishingState) {
 	st.DepthCM = saved.DepthCM
 	st.CastM = saved.CastM
 	st.CastActive = saved.CastActive
+	st.PVAReady = saved.PVAReady
 	st.CastTs = saved.CastTS
 	st.FallTs = saved.FallTS
 	st.FallSeen = saved.FallSeen
@@ -131,6 +132,7 @@ func fishingStateSnapshot(st *FishState) *store.FishingState {
 		DepthCM:        st.DepthCM,
 		CastM:          st.CastM,
 		CastActive:     st.CastActive,
+		PVAReady:       st.PVAReady,
 		CastTS:         st.CastTs,
 		FallTS:         st.FallTs,
 		FallSeen:       st.FallSeen,
@@ -161,6 +163,7 @@ func rolledFishToStore(f *RolledFish) *store.FishingFish {
 		HookGUID:    f.HookGUID,
 		BaitGUIDs:   f.BaitGUIDs,
 		BaitsKnown:  f.BaitsKnown,
+		BaitItem:    f.BaitItem,
 		BiteQuality: f.BiteQuality, HookHoldP: f.HookHoldP, LuckProtected: f.LuckProtected,
 		HookConfirmed: f.HookConfirmed,
 		HuntStage:     f.HuntStage, HuntStageKnown: f.HuntStageKnown,
@@ -201,6 +204,7 @@ func rolledFishFromStore(f *store.FishingFish) *RolledFish {
 		HookGUID:    f.HookGUID,
 		BaitGUIDs:   f.BaitGUIDs,
 		BaitsKnown:  f.BaitsKnown,
+		BaitItem:    f.BaitItem,
 		BiteQuality: f.BiteQuality, HookHoldP: f.HookHoldP, LuckProtected: f.LuckProtected,
 		HookConfirmed: f.HookConfirmed,
 		HuntStage:     f.HuntStage, HuntStageKnown: f.HuntStageKnown,
@@ -245,6 +249,9 @@ func (s *Server) resumeFishingState(st *FishState) {
 	if sess == nil {
 		return
 	}
+	// 饵效控速惰性补算：恢复的杆没有节奏因子（仅进程内），补一次防止
+	// 重启后差饵按无节奏控制判鱼。
+	s.ensurePaceState(sess, st)
 
 	st.mu.Lock()
 	resumed := st.persist.sessionID != sess.ID

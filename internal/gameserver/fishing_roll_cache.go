@@ -12,11 +12,25 @@ type cachedGradeLines struct {
 	// minG 是该鱼种的自然最小体重（species_weight.min_g），用于给「未达标」
 	// 档定下界。nil 表示没有可用的 min_g。
 	minG *int64
+	// lureSizeCM 是当前中鱼拟饵的长度（厘米）。>0 时按长度把最小鱼重量
+	// 向达标线抬升，并同步压缩未达标档占比；0 表示非拟饵/未知，不启用。
+	lureSizeCM float64
 }
 
 type cachedBaitDef struct {
 	bait ruleBait
 	ok   bool
+}
+
+// legacyBaitIDs 把 item_catalog 里的新 id 映射回 companion_bait_fish 快照中的
+// 旧 id。两张表同名不同 id 并存（craft_bait_dough_cottage 等），只认新 id 会
+// 让这批证据永远查不到。
+var legacyBaitIDs = map[string]string{
+	"dough_cottage": "craft_bait_dough_cottage",
+	"dough_garlic":  "craft_bait_dough_garlic",
+	"porridge_corn": "craft_bait_kukuruz_kasha",
+	"dough_honey":   "craft_bait_med_testo",
+	"c_bleak_lf":    "c_bleak",
 }
 
 type localBaitEvidenceKey struct {
@@ -206,7 +220,7 @@ func (s *Server) cachedBaitTiers(ctx context.Context, c fishRollContext, bait st
 	}
 	cache := rollCache(c)
 	if cache == nil {
-		return s.DB.BaitTiers(ctx, bait)
+		return s.loadBaitTiers(ctx, bait)
 	}
 	cache.mu.Lock()
 	if cache.baitTierLoaded[bait] {
@@ -215,11 +229,19 @@ func (s *Server) cachedBaitTiers(ctx context.Context, c fishRollContext, bait st
 		return tiers
 	}
 	cache.mu.Unlock()
-	tiers := s.DB.BaitTiers(ctx, bait)
+	tiers := s.loadBaitTiers(ctx, bait)
 	cache.mu.Lock()
 	cache.baitTiers[bait] = tiers
 	cache.baitTierLoaded[bait] = true
 	cache.mu.Unlock()
+	return tiers
+}
+
+func (s *Server) loadBaitTiers(ctx context.Context, bait string) map[string]int64 {
+	tiers := s.DB.BaitTiers(ctx, bait)
+	if old, ok := legacyBaitIDs[bait]; ok && len(tiers) == 0 {
+		return s.DB.BaitTiers(ctx, old)
+	}
 	return tiers
 }
 

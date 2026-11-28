@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -335,14 +337,40 @@ func actionNamesForTest() []string {
 	}
 }
 
+func TestSeaGuideSpotLabelDistinguishesUnknownAndOutside(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		r    *fishRollRuntime
+		want string
+	}{
+		{"无上下文", nil, "未知"},
+		{"只有声呐区", &fishRollRuntime{chartKnown: true, zone: 170, zoneKnown: true}, "未知"},
+		{"纸图已知但无标注", &fishRollRuntime{chartKnown: true, guideKnown: true}, "标注范围外"},
+		{"纸图命中", &fishRollRuntime{chartKnown: true, guideKnown: true, guideSpot: 75}, "75"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.r.guideSpotLabel(); got != tc.want {
+				t.Fatalf("label=%q，期望 %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadFishSpotPreferenceMatchesChartZone(t *testing.T) {
 	srv, db := newRigTestServer(t)
-	seed := "INSERT INTO spot_fish(loc,spot,fish_key,catches) VALUES('chart-zone-test','120','atl_cod',9),('chart-zone-test','120:3','atl_haddock',7),('chart-zone-test','75','atl_mackerel',5)"
+	if _, err := db.SQL.Exec(`INSERT OR REPLACE INTO loc_alias(alias,loc) VALUES('level_012_north_sea','挪威海')`); err != nil {
+		t.Fatal(err)
+	}
+	seed := `INSERT INTO spot_fish(loc,spot,fish_key,catches) VALUES
+		('chart-zone-test','120','atl_cod',9),('chart-zone-test','120:3','atl_haddock',7),
+		('chart-zone-test','75','atl_mackerel',5),('chart-zone-test','80','x_gladius',16),
+		('chart-zone-test','133','legacy_sonar',99)`
 	if _, err := db.SQL.Exec(seed); err != nil {
 		t.Fatal(err)
 	}
-	c := &fishRollContext{runtime: &fishRollRuntime{zoneKnown: true, zone: 120}}
-	pref, hasData := srv.loadFishSpotPreference(context.Background(), "chart-zone-test", c)
+	c := &fishRollContext{loc: "level_012_north_sea", x: 4257.9, z: 6.16, hasPos: true}
+	srv.prepareFishRollRuntime(t.Context(), c, "chart-zone-test")
+	pref, hasData := c.runtime.spotPref, c.runtime.spotData
 	if !hasData || pref["atl_cod"] <= 0 {
 		t.Fatalf("当前海图区号的观测没有生效: %v has=%v", pref, hasData)
 	}
@@ -352,8 +380,24 @@ func TestLoadFishSpotPreferenceMatchesChartZone(t *testing.T) {
 	if _, ok := pref["atl_mackerel"]; ok {
 		t.Fatal("其他区号的观测不能带进当前区号")
 	}
-	if _, has := srv.loadFishSpotPreference(context.Background(), "chart-zone-test", &fishRollContext{}); has {
-		t.Fatal("定位不到海图区号时不该启用钓点观测")
+	swordfish := fishRollContext{loc: "loc12_252", x: 3282, z: -925, hasPos: true}
+	srv.prepareFishRollRuntime(t.Context(), &swordfish, "chart-zone-test")
+	if got := swordfish.runtime.spotPref; len(got) != 1 || got["x_gladius"] != 4 {
+		t.Fatalf("80米钓点应读取标深80的16条剑鱼观测：%v", got)
+	}
+	legacy := &fishRollContext{runtime: &fishRollRuntime{chartKnown: true, guideKnown: true, guideSpot: 133}}
+	if got, has := srv.loadFishSpotPreference(t.Context(), "chart-zone-test", legacy); has || len(got) != 0 {
+		t.Fatalf("旧声呐网格号不能当成纸图标深观测：%v has=%v", got, has)
+	}
+	for _, unknown := range []fishRollContext{
+		{loc: "loc12_80"}, // 声呐80区不能归入80米钓点的观测
+		{loc: "level_012_north_sea", x: 3500, z: 700, hasPos: true}, // 声呐120号，未标定为120米钓点
+		{loc: "loc12_170"}, // 只有声呐区号，没有可核对的落点
+	} {
+		srv.prepareFishRollRuntime(t.Context(), &unknown, "chart-zone-test")
+		if unknown.runtime.spotData {
+			t.Fatalf("无已核对的攻略点时不应给观测加权：%+v", unknown.runtime)
+		}
 	}
 }
 
@@ -391,5 +435,66 @@ func TestPrepareFishRollRuntimeInlandHasNoChart(t *testing.T) {
 	}
 	if c.runtime.zoneKnown {
 		t.Fatal("内陆湖不该定位出海图区号")
+	}
+}
+
+func TestFishRollOnlyResolvesVerifiedLevelKeys(t *testing.T) {
+	s, _ := newStaticRigTestServer(t)
+	for loc, want := range map[string]string{
+		"loc1_03": "level_001_lake", "level_001_lake": "level_001_lake",
+		"": "", "unknown_scene": "", "level_invalid": "",
+	} {
+		if got := s.resolveRollLevelKey(t.Context(), loc); got != want {
+			t.Errorf("resolve %q = %q, want %q", loc, got, want)
+		}
+	}
+}
+
+func TestCastDepthSourceInRollAndQuery(t *testing.T) {
+	// Exercise the same once-loaded file as production in a fresh process.
+	if os.Getenv("RF4_TEST_DEPTH_LOOKUP_CHILD") == "" {
+		grid := castWaterDepthGrid{Version: 1, Level: "level_001_lake", X: 378, Z: 435, Step: 1,
+			Width: 2, Height: 2, Millimeters: []byte{232, 3, 232, 3, 232, 3, 232, 3}}
+		data, err := json.Marshal(grid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "depth.json")
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("RF4_CAST_WATER_DEPTH_FILE", path)
+		t.Setenv("RF4_TEST_DEPTH_LOOKUP_CHILD", "1")
+		if output, err := exec.Command(os.Args[0], "-test.run=^TestCastDepthSourceInRollAndQuery$").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, output)
+		}
+		return
+	}
+	s, _ := newStaticRigTestServer(t)
+	c := fishRollContext{loc: "loc1_03", rigType: 1, x: 378.5, z: 435.5, hasPos: true}
+	for _, tc := range []struct {
+		name       string
+		playerOnly bool
+		query      *fishQueryCapture
+		want       float64
+	}{
+		{"cast", false, nil, 1}, {"manual query", false, &fishQueryCapture{}, 1},
+		{"region only", false, &fishQueryCapture{regional: true}, 0}, {"player position", true, nil, 0},
+	} {
+		c.playerPosOnly, c.query = tc.playerOnly, tc.query
+		s.prepareFishRollRuntime(t.Context(), &c, "")
+		if c.measuredWaterDepthM != tc.want {
+			t.Errorf("%s depth = %v, want %v", tc.name, c.measuredWaterDepthM, tc.want)
+		}
+	}
+}
+
+func TestFloatWaterConditionsStopAtBed(t *testing.T) {
+	p := defaultFishEcology("crucian")
+	c := fishRollContext{rigType: 1, depthCM: 25, measuredWaterDepthM: .25, now: time.Unix(worldDayEpochUnix, 0)}
+	atBed := fishWaterConditionsFor(p, c)
+	c.depthCM = 200
+	if got := fishWaterConditionsFor(p, c); got != atBed {
+		t.Errorf("adding line below the lake bed changed water conditions: %+v -> %+v", atBed, got)
 	}
 }

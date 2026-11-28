@@ -201,6 +201,8 @@ type castDistanceProfile struct {
 	CastAction           uint32
 	CastPower            float64
 	ReelType             int64
+	RodType              int64 // 竿子类 fopbhlmkcpe；仅在 RodParsed 为真时有效
+	RodParsed            bool  // 本杆实例与 item_def 都解析成功（竿 GUID 有效）
 	SpoolSize            int64
 	SpoolCapacityM       float64
 	SpoolFill            float64
@@ -582,9 +584,10 @@ func (s *Server) castDistanceForRig(ctx context.Context, uid int64, rodGUID stri
 	if rod, rerr := s.DB.GetItemByGUID(ctx, rodGUID); rerr == nil && rod != nil {
 		if def, derr := s.itemDefForRow(ctx, rod); derr == nil {
 			// 竿型（fopbhlmkcpe）是投距技能的竿侧 gate 输入；无轮手竿也要用。
-			if v, ok := defAttrF64(def, "fopbhlmkcpe"); ok {
-				rodType = int64(v)
-			}
+			// 解析结果顺带记进 p.RodType，供 14/4 上鱼事件判竿型成就，
+			// 避免每杆为成就再多查一次竿定义。
+			rodType = rodDefRodType(def)
+			p.RodType, p.RodParsed = rodType, true
 			p.RodLengthM = rodLengthM(def)
 			p.RodAction = rodAction(def)
 			p.RodStiffness = rodStiffness(def)
@@ -678,8 +681,12 @@ func (s *Server) castDistanceForRig(ctx context.Context, uid int64, rodGUID stri
 		p.DistanceM = math.Min(p.DistanceM, p.LineLimitM)
 	}
 	if clip, ok := s.savedReelClipM(ctx, rodGUID); ok && clip > 0 {
+		// 卡线不折进 DistanceM：158.f1 是客户端力度条量程，必须保持全量程，
+		// 贴卡由客户端按竿树 153.f5 截停（官方语义：满格=物理满距，卡线是
+		// 机械止线）。折进量程会把力度条缩成 0..卡米，小于卡米的力度永远
+		// 贴不到卡米数（2026-11-19 实机实证：卡 8 时 requested 5.88~7.64
+		// 全部按比例缩水）。只作为 ClipLimitM 元数据供 hCast 收口与日志。
 		p.ClipLimitM = float64(clip)
-		p.DistanceM = math.Min(p.DistanceM, p.ClipLimitM)
 	}
 	if p.DistanceM < 0.5 {
 		p.DistanceM = 0.5

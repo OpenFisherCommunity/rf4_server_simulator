@@ -27,7 +27,7 @@ gateway:
   region: "CN"                        # 客户端区域值。
   server_name: "RF4_566"              # 登录应答中返回的服务器名称。
   login_domain: "api.rf4game.ru"      # 主登录域名及证书主题。
-  max_conns: 512                      # realtime 最大并发连接数。
+  max_conns: 512                      # realtime 最大并发连接数；须在 1..100000 之间，超出范围会拒绝启动。
   ack_client_frames: true             # 处理客户端帧前先发送协议 ACK。
   transport_keepalive_sec: 5.0        # 空传输帧保活间隔（秒）。
   obs_addr: ":9501"                   # 健康检查、指标和性能分析监听地址。
@@ -38,6 +38,7 @@ gateway:
   # 运行参数默认值，钓鱼限制可通过管理后台覆盖。
   token_ttl_days: 365                 # 登录 token 有效期（天）。
   userid_start: 1000001               # 登录服务分配的第一个 user ID。
+  userid_map_file: ""                 # 局域网 IP→userid 映射表路径；留空则用工作目录下的 gateway_ip_uids.json。
   bite_probability: 1.0               # 每次抛竿出鱼的概率；1.0 表示每次都有鱼。
   bite_delay_scale: 1.0               # 标准咬钩延迟分布的倍率。
   bite_delay_fixed: 0                 # 固定咬钩延迟（秒）；大于 0 时不再使用分布。
@@ -50,9 +51,13 @@ game:
   obs_addr: ":9502"                   # 健康检查、指标和性能分析监听地址。
   default_userid: 1000001             # seed 创建的玩家档案 user ID。
   keepalive_interval_sec: 5.0         # 世界时钟推送间隔（秒）。
+  # 天气序列：启动时按每张图加权生成晴/少云/多云/雨/暴雨/雷暴。
+  weather:
+    randomize: true                   # false=沿用地图模板的固定 kind 顺序。
+    cycle_days: 64                    # 每图序列天数，最小 8。
 
 admin:
-  http_addr: ":8080"                          # 仅 cmd/admin 独立调试使用；launcher 不监听此端口。
+  http_addr: "127.0.0.1:8080"                 # 独立管理后台的监听地址；默认只绑本机，需要局域网访问时改成 ":8080"。launcher 不监听此端口。
   jwt_secret: "replace-with-long-random-secret"  # 管理员会话 token 的签名密钥。
   obs_addr: ":9503"                           # 仅 cmd/admin 独立调试使用。
   username: "admin"                           # 管理员用户名。

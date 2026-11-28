@@ -234,7 +234,7 @@ func (s *Server) buildPending25(f *RolledFish, st *FishState, levelKey string) *
 		WeightG:  f.WeightG,
 		LengthM:  f.LengthM,
 		Cat:      f.Grade,
-		KeepBait: st.Bait,
+		KeepBait: catchBaitItem(f, st.Bait),
 		TS:       float64(time.Now().UnixNano()) / 1e9,
 	}
 	return buildKeepnet25(e, levelKey, s.rarityOf25(f.Species), s.fishModelVariantFor(f))
@@ -286,7 +286,7 @@ func (s *Server) fishingKeep(ctx *Ctx) ([]byte, bool) {
 		keptInNet, err := s.DB.KeepFishingCatchWithCapacity(cctx, &store.KeepnetEntry{
 			EchoGUID: echo, UID: uid, Species: kept.Species, NameZh: kept.Name,
 			WeightG: kept.WeightG, LengthM: kept.LengthM, Cat: kept.Grade,
-			KeepLoc: st.Loc, KeepSpot: int64(st.Spot), KeepBait: st.Bait,
+			KeepLoc: st.Loc, KeepSpot: int64(st.Spot), KeepBait: catchBaitItem(&kept, st.Bait),
 			KeepLevel: keepLevel, TS: float64(time.Now().UnixNano()) / 1e9,
 			TackleCat: tackleCat,
 		}, kept.XP, kept.Silver, capacity)
@@ -440,7 +440,7 @@ func (s *Server) keepBatchCatches(ctx context.Context, uid int64, batch []*Rolle
 		e := &store.KeepnetEntry{
 			EchoGUID: f.FishGUID, UID: uid, Species: f.Species, NameZh: f.Name,
 			WeightG: f.WeightG, LengthM: f.LengthM, Cat: f.Grade,
-			KeepLoc: loc, KeepSpot: spot, KeepBait: bait,
+			KeepLoc: loc, KeepSpot: spot, KeepBait: catchBaitItem(f, bait),
 			KeepLevel: level, TS: float64(time.Now().UnixNano()) / 1e9,
 			TackleCat: tackleCat,
 		}
@@ -535,7 +535,7 @@ func (s *Server) fishingRelease(ctx *Ctx) ([]byte, bool) {
 		}
 		ratio := s.tunableF("release_xp_ratio", 0.5)
 		bonus := int64(math.Round(float64(base) * ratio))
-		result, gifts, replayed, err := s.releaseCatchOnce(cctx, uid, pending.FishGUID, bonus, rigType)
+		result, gifts, replayed, err := s.releaseCatchOnce(cctx, uid, pending.FishGUID, bonus, rigType, pending.Grade)
 		if err != nil {
 			ctx.Log.Warn("放生保存失败", "err", err)
 			ctx.ReplyFailure("System.IO.IOException", "放生未能保存，请重试")
@@ -566,7 +566,7 @@ func (s *Server) fishingRelease(ctx *Ctx) ([]byte, bool) {
 				base = b
 			}
 			extraReleaseBonus := int64(math.Round(float64(base) * ratio))
-			res, extraGifts, replayedExtra, err := s.releaseCatchOnce(cctx, uid, f.FishGUID, extraReleaseBonus, rigType)
+			res, extraGifts, replayedExtra, err := s.releaseCatchOnce(cctx, uid, f.FishGUID, extraReleaseBonus, rigType, f.Grade)
 			if err != nil {
 				ctx.Log.Warn("14/6 多钩额外鱼放生失败", "fish", shortGUID(f.FishGUID), "err", err)
 				continue
@@ -596,7 +596,10 @@ func (s *Server) fishingRelease(ctx *Ctx) ([]byte, bool) {
 			ctx.Sess.Push2_6(max64(1, extraLevel-1))
 		}
 		if !replayed && pending.NamedID != "" {
-			s.DB.NamedFishNoteRecatch(cctx, pending.NamedID)
+			if err := s.DB.NamedFishNoteRecatch(cctx, pending.NamedID); err != nil {
+				// 计数只用于展示，失败不阻断放生主流程。
+				ctx.Log.Warn("命名鱼重复钓获计数失败", "fish", shortGUID(pending.NamedID), "err", err)
+			}
 		}
 		if !replayed {
 			// 放生的鱼在 14/4 结算时已落 catch_log 并点亮图鉴，这里补推新档案，
@@ -625,9 +628,18 @@ func (s *Server) fishingRelease(ctx *Ctx) ([]byte, bool) {
 			}
 		}
 		s.notifyFishReleased(ctx.Sess, pending)
-		s.evaluateAchievements(ctx, achievementEvent{
-			Kind: evFishReleased, Grade: pending.Grade,
-		})
+		// 911 的计数在上面的放生事务里已经累加，直接读计数器装配事件；
+		// 912 仍只用本次放流鱼的档位判断。
+		rareReleased, rareErr := s.rareReleasedCount(cctx, uid)
+		if rareErr != nil {
+			// 读取故障不能当成「未达标」，否则会静默漏掉本次成就判定。
+			ctx.Log.Warn("累计放生稀有鱼计数读取失败，跳过成就判定", "uid", uid, "err", rareErr)
+		} else {
+			s.evaluateAchievements(ctx, achievementEvent{
+				Kind: evFishReleased, Grade: pending.Grade,
+				RareReleased: rareReleased,
+			})
+		}
 	}
 	// 响应 807：{null, [811礼物行], 307, null, null, null}；未升级时 f1=null
 	//（官服未升级放流样本形态，见 monitor docs/LEVEL_UP_GIFT_CARDS.md）。

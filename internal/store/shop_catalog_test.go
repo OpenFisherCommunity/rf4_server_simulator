@@ -171,6 +171,13 @@ func TestTungusShopAdminAndPurchaseShelvesAgree(t *testing.T) {
 	if err != nil || len(items) != 95 {
 		t.Fatalf("管理后台应保留93件上游商品并补齐两件特产: count=%d err=%v", len(items), err)
 	}
+	if items[0].HasOverride {
+		t.Fatal("fixture: first row must not have an override")
+	}
+	filtered, err := db.ListAdminStoreItemsFiltered(ctx, "tungus_015", "", 1, true)
+	if err != nil || len(filtered) != 1 || filtered[0].ItemID != "tungus_bot" {
+		t.Fatalf("筛选覆盖应早于 limit: %+v, %v", filtered, err)
+	}
 	var totalStock int64
 	for _, row := range items {
 		price, err := db.ShopItemGet(ctx, "tungus_015", row.ItemID)
@@ -484,5 +491,155 @@ func TestCafeStoreShelfComesFromStoreDefinition(t *testing.T) {
 	}
 	if shelf.Source != shopShelfSourceStore {
 		t.Fatalf("咖啡馆货架来源=%q want=%q", shelf.Source, shopShelfSourceStore)
+	}
+}
+
+// hasShopPrice 判断货架里是否有指定商品，用于“不应补入”的断言。
+func hasShopPrice(rows []*ShopPrice, itemID string) bool {
+	for _, row := range rows {
+		if row.ItemID == itemID {
+			return true
+		}
+	}
+	return false
+}
+
+// 通用地图钓鱼站共享价格表：货架上已有、但缺银价或金币价的商品，
+// 用别的钓鱼站实录里的真实价格补上；不新增商品，也不覆盖已有价格。
+func TestShopCatalogFillsMissingPricesAcrossFishingStores(t *testing.T) {
+	db := openShopCatalogTestDB(t)
+	ctx := context.Background()
+	if _, err := db.SQL.Exec(`INSERT INTO shop_item(store_id,item_id,silver,gold,stock) VALUES
+		('craft_baits_012','need_silver',9999,100,1),
+		('craft_baits_012','need_gold',1234,150,1),
+		('fishing_store_01','need_silver',0,100,5),
+		('fishing_store_01','need_gold',1234,0,6),
+		('fishing_store_01','keep_both',100,10,7),
+		('fishing_store_01','override_zero',50,10,1),
+		('fishing_store_02','need_silver',5678,100,9),
+		('fishing_store_02','keep_both',999,99,9),
+		('fishing_store_02','override_zero',50,10,1),
+		('fishing_store_02','only_in_02',999,0,1);
+		INSERT INTO item_price(item_id,silver,gold,stock) VALUES('need_gold',0,200,0);
+		INSERT INTO shop_item_override(store_id,item_id,silver,gold,stock) VALUES('fishingstore_006','override_zero',0,10,1);`); err != nil {
+		t.Fatal(err)
+	}
+
+	// fishingstore_006 复用 fishing_store_01 实录：应在原条目上补价格。
+	other, err := db.ShopItems(ctx, "fishingstore_006")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other) != 4 {
+		t.Fatalf("补价格不得新增或删除商品: %+v", other)
+	}
+	if p := findShopPrice(t, other, "need_silver"); p.Silver != 5678 || p.Gold != 100 || p.Stock != 5 {
+		t.Fatalf("缺银价应取多店中的最小正值: %+v", p)
+	}
+	if p := findShopPrice(t, other, "need_gold"); p.Silver != 1234 || p.Gold != 150 || p.Stock != 6 {
+		t.Fatalf("缺金币价应取实录与 item_price 中的最小正值: %+v", p)
+	}
+	if p := findShopPrice(t, other, "keep_both"); p.Silver != 100 || p.Gold != 10 {
+		t.Fatalf("已有价格不得被覆盖: %+v", p)
+	}
+	if p := findShopPrice(t, other, "override_zero"); p.Silver != 0 || p.Gold != 10 {
+		t.Fatalf("显式 0 覆盖不能被跨店补价重新填回: %+v", p)
+	}
+	if hasShopPrice(other, "only_in_02") {
+		t.Fatal("不得新增别店独有的商品")
+	}
+
+	// 源店自己已完整的行保持原样。
+	second, err := db.ShopItems(ctx, "fishing_store_02")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := findShopPrice(t, second, "keep_both"); p.Silver != 999 || p.Gold != 99 {
+		t.Fatalf("源店原价被改动: %+v", p)
+	}
+	if p := findShopPrice(t, second, "only_in_02"); p.Silver != 999 || p.Gold != 0 {
+		t.Fatalf("源店独有商品被改动: %+v", p)
+	}
+
+	// 品牌店不参与通用钓鱼站的价格补齐。
+	brand, err := db.ShopItems(ctx, "ny_bazaarStore_001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasShopPrice(brand, "need_silver") {
+		t.Fatal("品牌店不得补入通用钓鱼站的商品")
+	}
+}
+
+// 运行时按 item_price 补出来的商品（别的钓鱼站没有实录行），
+// 也要能从有实录的钓鱼站补到缺失的银价。
+func TestShopCatalogFillsSilverForSupplementedFishingItems(t *testing.T) {
+	db := openShopCatalogTestDB(t)
+	ctx := context.Background()
+	if _, err := db.SQL.Exec(`INSERT INTO item_def(numeric_id,item_id,category,kind,brand,attrs_json) VALUES
+		(991101,'base_rod',6,'rod','','{}'),
+		(991102,'spin_shared',6,'rod_spinning','','{}');
+		INSERT INTO item_catalog(item_id,name,name_zh,kind,numeric_id) VALUES
+		('base_rod','Base Rod','Base Rod','rod',991101),
+		('spin_shared','Shared Rod 10000','Shared Rod 10000','rod_spinning',991102);
+		INSERT INTO item_price(item_id,silver,gold,stock) VALUES('spin_shared',0,100,0);
+		INSERT INTO shop_item(store_id,item_id,silver,gold,stock) VALUES
+		('fishing_store_01','base_rod',100,0,1),
+		('fishing_store_02','spin_shared',5678,100,1);`); err != nil {
+		t.Fatal(err)
+	}
+
+	// fishingstore_006 复用 01 的 base_rod，augment 会按 item_price 补出
+	// spin_shared（只有金币价），随后应从 02 实录补上银价 5678。
+	rows, err := db.ShopItems(ctx, "fishingstore_006")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := findShopPrice(t, rows, "spin_shared")
+	if p.Silver != 5678 || p.Gold != 100 {
+		t.Fatalf("运行时补出的商品缺银价时未从别店实录补上: %+v", p)
+	}
+}
+
+// 货架库存（22/1 的 f3）是展示量，不是可消耗的存货：解析层只把 0 补满到展示值，
+// 既不写库、也不随购买减少，因此项目里没有“限量商品”。
+func TestShopShelfStockIsDisplayOnly(t *testing.T) {
+	db := openShopCatalogTestDB(t)
+	ctx := context.Background()
+	if _, err := db.SQL.Exec(`INSERT INTO item_def(numeric_id,item_id,category,kind,brand,attrs_json) VALUES
+ (991201,'sold_out_line',11,'line','brand_test','{}'),(991202,'stock_one_line',11,'line','brand_test','{}');
+ INSERT INTO shop_item(store_id,item_id,silver,gold,stock) VALUES
+ ('fishingstore_009','sold_out_line',100,0,0),('fishingstore_009','stock_one_line',100,0,1);`); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := db.ShopItems(ctx, "fishingstore_009")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := findShopPrice(t, first, "sold_out_line"); p.Stock != shopShelfRestockStock {
+		t.Fatalf("零库存应补满为展示值 %d，实际 %d", shopShelfRestockStock, p.Stock)
+	}
+	if p := findShopPrice(t, first, "stock_one_line"); p.Stock != 1 {
+		t.Fatalf("实录库存 1 应原样展示 1，实际 %d", p.Stock)
+	}
+
+	// 重复解析必须得到同一结果：补满只发生在返回值上，不写回 shop_item 或覆盖表。
+	second, err := db.ShopItems(ctx, "fishingstore_009")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again := findShopPrice(t, second, "sold_out_line"); again.Stock != shopShelfRestockStock {
+		t.Fatalf("重复读取的库存展示值应稳定为 %d，实际 %d", shopShelfRestockStock, again.Stock)
+	}
+	var recorded, overrides int64
+	if err := db.SQL.QueryRow(`SELECT stock FROM shop_item WHERE store_id='fishingstore_009' AND item_id='sold_out_line'`).Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SQL.QueryRow(`SELECT COUNT(*) FROM shop_item_override WHERE store_id='fishingstore_009'`).Scan(&overrides); err != nil {
+		t.Fatal(err)
+	}
+	if recorded != 0 || overrides != 0 {
+		t.Fatalf("库存补满不得写库：实录库存=%d，覆盖行=%d，期望 0 和 0", recorded, overrides)
 	}
 }

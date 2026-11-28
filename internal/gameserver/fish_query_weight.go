@@ -35,8 +35,8 @@ func (d fishWeightLaw) survival(weight float64) float64 {
 
 func (d fishWeightLaw) retainedMass(minimumG int64, luck float64) float64 {
 	if d.roundedSurvival != nil {
-		q := d.roundedSurvival(minimumG)
-		return q * (1 + clampFloat(luck, 0, 1)*(1-q))
+		// 档位比例模式按配置绝对占比，TrophyLuck 不得把高档概率二次放大。
+		return d.roundedSurvival(minimumG)
 	}
 	if d.scale <= 0 || d.mass == nil || d.upper <= d.lower {
 		return 0
@@ -130,6 +130,10 @@ func (s *Server) weightModelDB(ctx context.Context, key string, modeMult, scale,
 		lo = math.Min(lo, vf*0.2)
 	}
 	lo = math.Max(1.0, math.Min(lo, M*0.6))
+	// 拟饵长度增益：与档位比例模型同一口径，把最小鱼重量向达标线抬升。
+	if f := lureLengthFloorFactor(lureLengthCM(c)); f > 0 && vf > lo {
+		lo += (vf - lo) * f
+	}
 	if hi <= M {
 		hi = M * 1.6
 	}
@@ -145,7 +149,10 @@ func (s *Server) weightModelDB(ctx context.Context, key string, modeMult, scale,
 func (s *Server) weightLawDB(ctx context.Context, key string, modeMult, scale, capG float64, c fishRollContext) fishWeightLaw {
 	if s.tunableF("grade_ratio_enabled", 1) == 1 {
 		lines := s.cachedSettleStatics(ctx, c, key)
-		model, handled := s.gradeRatioModel(cachedGradeLines{val: &lines[0], trophy: &lines[1], blue: &lines[2]}, modeMult, scale, capG)
+		model, handled := s.gradeRatioModel(cachedGradeLines{
+			val: &lines[0], trophy: &lines[1], blue: &lines[2],
+			lureSizeCM: lureLengthCM(c),
+		}, modeMult, scale, capG)
 		if handled {
 			return fishWeightLaw{scale: scale, capG: capG, roundedSurvival: model.survival}
 		}

@@ -34,9 +34,11 @@ type Session struct {
 	// call_id 由 Server 按 token 共享分配，见 nextCallID；Session 不单独计数。
 
 	closed       atomic.Bool
-	awardsSynced atomic.Bool   // 奖赏分组 14 已向本会话推送过
+	awardsSyncMu sync.Mutex    // 奖赏分组同步串行化
+	awardsSynced bool          // 奖赏分组 14 已向本会话推送成功
 	stopCh       chan struct{} // 关闭信号（保活循环等监听）
 	stopOnce     sync.Once
+	stopInit     sync.Once // stopCh 惰性创建的守卫
 
 	// fishPushMu / fishPushGUID / fishPushAt 抑制同一尾鱼的重复 14/14 推送：
 	// 同一 GUID 短时间内推两次会让客户端重建鱼实体，模型与结算对不上。
@@ -51,6 +53,11 @@ type Session struct {
 	happyMu      sync.RWMutex
 	happyOpMu    sync.Mutex
 	happyStatus  store.HappyHourStatus
+
+	// 酒兴播报去重：文本 + 上次推送时刻，避免喝酒当刻与心跳重复刷屏
+	drinkReportMu   sync.Mutex
+	drinkReportText string
+	drinkReportAt   time.Time
 
 	log *slog.Logger
 }
@@ -72,8 +79,21 @@ func newSession(srv *Server, id uint64, token string, userid int64, c *tunnel.Co
 // Closed 会话是否已关闭。
 func (s *Session) Closed() bool { return s.closed.Load() }
 
+// stopSignal 返回会话的关闭信号通道。
+//
+// 手工构造的 Session（例如测试里的探针会话）没有初始化 stopCh，这里惰性补一个：
+// 否则 Close 会 close(nil) 直接 panic，Done() 也会返回 nil 通道（select 上永不触发）。
+func (s *Session) stopSignal() chan struct{} {
+	s.stopInit.Do(func() {
+		if s.stopCh == nil {
+			s.stopCh = make(chan struct{})
+		}
+	})
+	return s.stopCh
+}
+
 // Done 会话关闭通知。
-func (s *Session) Done() <-chan struct{} { return s.stopCh }
+func (s *Session) Done() <-chan struct{} { return s.stopSignal() }
 
 // SetState / GetState 会话状态存取（业务系统共享）。
 func (s *Session) SetState(key string, v any) {
@@ -223,9 +243,10 @@ func (s *Session) startKeepalive() {
 	go func() {
 		timer := time.NewTimer(500 * time.Millisecond)
 		defer timer.Stop()
+		stop := s.stopSignal()
 		for {
 			select {
-			case <-s.stopCh:
+			case <-stop:
 				return
 			case <-timer.C:
 				if s.closed.Load() {
@@ -247,6 +268,9 @@ func (s *Session) startKeepalive() {
 				s.keepaliveTicks++
 				if s.keepaliveTicks%6 == 0 {
 					s.expireRentalTickets()
+					// 酒兴播报刷新：每 6 拍（约 30 秒）推一次逐瓶剩余时间，
+					// 让聊天框里的剩余分秒随时间递减。开关默认关，无酒兴不推。
+					s.Srv.maybePushDrinkReport(s, time.Now())
 					// 有已启表的钓鱼游时同步推档案：客户端徽章的剩余时间
 					// 只在档案对象替换时重算，不推就一直显示旧值。
 					if s.hasTickingTrips(s.pushCtx()) {
@@ -260,17 +284,26 @@ func (s *Session) startKeepalive() {
 }
 
 // Close 关闭会话（幂等）。
+//
+// 手工构造的 Session（例如测试里的探针会话）可能没有 Srv / log / stopCh，
+// 这里逐项判空：任何一项缺失都不该让关闭流程 panic。
 func (s *Session) Close(reason string) {
 	if s.closed.CompareAndSwap(false, true) {
 		s.updateHappyHour(time.Now(), true)
 		s.updateDrinkBonuses(time.Now())
 		// 钓鱼游停表：离线暂停计时，把关闭时刻前的在线时长消费完。
 		s.consumeTripTimes(time.Now())
-		// 下线即离开所有地图：钓鱼游装备包全部回收（重登进图再发放）。
-		s.Srv.recallAllTripEquipment(s.pushCtx(), s.Userid)
-		s.log.Info("会话关闭", "reason", reason)
-		s.stopOnce.Do(func() { close(s.stopCh) })
-		s.Srv.removeSession(s)
+		if s.Srv != nil {
+			// 下线即离开所有地图：钓鱼游装备包全部回收（重登进图再发放）。
+			s.Srv.recallAllTripEquipment(s.pushCtx(), s.Userid)
+		}
+		if s.log != nil {
+			s.log.Info("会话关闭", "reason", reason)
+		}
+		s.stopOnce.Do(func() { close(s.stopSignal()) })
+		if s.Srv != nil {
+			s.Srv.removeSession(s)
+		}
 	}
 }
 

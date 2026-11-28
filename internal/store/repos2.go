@@ -20,10 +20,10 @@ const maxSkillPoints = 100.0
 // 99.99999999999996 这类尾差——显示为 100% 却仍小于上限，钳位后产生
 // 3.6e-14 的正残渣增量，客户端渲染出「+0 = 100%」技能行（2026-11-11 实测）。
 //
-// 四舍五入方向的安全性前提：熟练度增量恒为 0.1/0.2，且 profCap 减去量化后
-// 的旧值仍是 0.1 的整数倍，正常路径下本函数是恒等变换，不改变任何值。
-// 若未来引入非 0.1 网格的增量或修改 profCap（100.0），四舍五入最多会向上
-// 多给 0.05——届时需改为截断（math.Floor）并重新评估显示语义。
+// 档位熟练度倍数 skill_grade_mult_* 会让增量离开 0.1 网格：例如 1.5×0.1=0.15
+// 会被这里进位成 0.2，管理端文案已建议改用 1/2/4/8 这类整数倍。
+// profCap 减去量化后的旧值仍是 0.1 的整数倍，钳位路径不会越界；
+// 若以后改成截断（math.Floor），需要重新评估显示语义和现有倍数配置。
 func QuantizeSkillPoints(v float64) float64 {
 	return math.Round(v*10) / 10
 }
@@ -882,34 +882,93 @@ func (d *DB) SpawnModeSet(ctx context.Context, mode, updatedBy string) error {
 	return tx.Commit()
 }
 
-// biteModeKeys 是「鱼汛模式」预设统管的五个开关。与发鱼模式不同，
-// 五个开关也可以在鱼群规则条里逐个手调（那是合法的 mixed 状态）。
-var biteModeKeys = []string{
+// biteModeLegacyKeys 是旧版鱼汛模式的五个开关。
+var biteModeLegacyKeys = []string{
 	"bite_gate_enabled", "fish_ecology_enabled", "fish_weather_enabled",
 	"fish_bait_rules_enabled", "fish_distribution_enabled",
 }
 
-// BiteModeFor 由当前 tunables 推断鱼汛模式：realistic=五开、legacy=五关，
-// 其余为 mixed（管理员手动改过单个开关）。
+// biteModeKeys 是预设统管的全部开关：旧五开关 + 后加的海钓水层影响。
+// 与发鱼模式不同，这些开关也可以在鱼群规则条里逐个手调（那是合法的 mixed 状态）。
+var biteModeKeys = append(append([]string(nil), biteModeLegacyKeys...), "marine_layer_enabled")
+
+// BiteModeFor 由当前 tunables 推断鱼汛模式：
+//   - 六开 = realistic；
+//   - 旧五开关全关、且海钓水层未开启 = legacy；
+//   - 其余 = mixed（管理员手动改过单个开关）。
+//
+// 旧库没有 marine_layer_enabled 这一行，读出来是空串。缺失要按“关”处理：
+// 五个旧开关全关时仍应显示 legacy，否则升级后整页会错报成「自定义组合」。
 func BiteModeFor(t map[string]string) string {
-	all, none := true, true
+	allOn := true
 	for _, key := range biteModeKeys {
-		if t[key] == "1" {
-			none = false
-		} else {
-			all = false
+		if t[key] != "1" {
+			allOn = false
+			break
 		}
 	}
-	switch {
-	case all:
+	if allOn {
 		return "realistic"
-	case none:
+	}
+	legacy := true
+	for _, key := range biteModeLegacyKeys {
+		if t[key] == "1" {
+			legacy = false
+			break
+		}
+	}
+	if legacy && t["marine_layer_enabled"] != "1" {
 		return "legacy"
 	}
 	return "mixed"
 }
 
-// BiteModeSet 原子切换鱼汛模式：realistic=五开，legacy=五关。
+var skillGainPctKeys = []string{
+	"skill_gain_pct_1", "skill_gain_pct_2", "skill_gain_pct_3", "skill_gain_pct_11",
+	"skill_gain_pct_4", "skill_gain_pct_6", "skill_gain_pct_5", "skill_gain_pct_8",
+}
+
+// SkillGainModeSet 原子切换技能升级概率模式。
+// native=全部 0（原版），fixed100=全部 100，custom 只更新 UI 标记，保留现有逐项值。
+func (d *DB) SkillGainModeSet(ctx context.Context, mode, updatedBy string) error {
+	pct := ""
+	switch mode {
+	case "native":
+		pct = "0"
+	case "fixed100":
+		pct = "100"
+	case "custom":
+	default:
+		return fmt.Errorf("未知技能升级概率模式: %s", mode)
+	}
+	now := float64(time.Now().Unix())
+	tx, err := d.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if pct != "" {
+		for _, key := range skillGainPctKeys {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO tunables(key, value, updated_by, updated_ts) VALUES(?,?,?,?)
+				ON CONFLICT (key) DO UPDATE SET value=?, updated_by=?, updated_ts=?`,
+				key, pct, updatedBy, now,
+				pct, updatedBy, now); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tunables(key, value, updated_by, updated_ts) VALUES('skill_gain_mode',?,?,?)
+		ON CONFLICT (key) DO UPDATE SET value=?, updated_by=?, updated_ts=?`,
+		mode, updatedBy, now,
+		mode, updatedBy, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BiteModeSet 原子切换鱼汛模式：realistic=六开，legacy=六关。
 func (d *DB) BiteModeSet(ctx context.Context, mode, updatedBy string) error {
 	value := "0"
 	switch mode {
@@ -976,6 +1035,15 @@ func (d *DB) KVSet(ctx context.Context, key, value string) error {
 // QueuePush 管理指令入队（admin 进程投递）。
 func (d *DB) QueuePush(ctx context.Context, payload string) error {
 	_, err := d.SQL.ExecContext(ctx,
+		`INSERT INTO admin_queue(payload, created_ts) VALUES(?,?)`,
+		payload, float64(time.Now().Unix()))
+	return err
+}
+
+// QueuePushTx 在调用方事务里投递管理指令。管理后台把审计行与指令放进同一事务
+// 提交：任一写入失败都整笔回滚，避免接口已回成功而指令未入队。
+func (d *DB) QueuePushTx(ctx context.Context, tx *sql.Tx, payload string) error {
+	_, err := tx.ExecContext(ctx,
 		`INSERT INTO admin_queue(payload, created_ts) VALUES(?,?)`,
 		payload, float64(time.Now().Unix()))
 	return err

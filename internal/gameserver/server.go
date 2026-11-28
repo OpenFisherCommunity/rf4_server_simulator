@@ -73,18 +73,36 @@ type Server struct {
 	marineFishMu   sync.RWMutex
 	marineFishKeys map[string]bool
 
+	// 海钓下沉时长学习：loc12_N + 钓组类别 -> 触底事件反推的满程时长。
+	// 仅内存、重启丢失；样本不足时回退默认时长。
+	marineDescentMu    sync.Mutex
+	marineDescentCache map[string]marineDescentSample
+
 	// rf4records 饵占比缓存（食性分级提案 bait-evidence-threshold 的占比判据）。
 	// 键 fish_key -> bait_id -> 占比百分比（0~100）；异步预热，TTL 30 分钟。
-	rf4ShareMu      sync.RWMutex
-	rf4ShareCache   map[string]map[string]float64
+	rf4ShareMu    sync.RWMutex
+	rf4ShareCache map[string]map[string]float64
+	// 每条鱼对拟饵（item_def.category = 17）的官方占比，0~100。
+	// 拟饵门只用它来分档：低于阈值直接不给这条鱼派拟饵，
+	// 避免「拟饵」通配把草鱼、欧鳊这类偶然吃软饵的鱼当成路亚目标。
+	rf4LureShare    map[string]float64
 	rf4ShareAt      time.Time
 	rf4ShareLoaded  bool
 	rf4ShareLoading atomic.Bool
+	// rf4FishTotal 保存每条鱼在 rf4records_catch 里的有效纪录总数，
+	// 与 rf4ShareCache 同锁同 TTL，用于判断证据量是否足够做判鱼筛选。
+	rf4FishTotal map[string]float64
 
 	// 区域固定鱼种名册缓存（后台可写，TTL 30 秒对齐 tunables 热更节奏）
 	fishZoneMu    sync.RWMutex
 	fishZoneCache map[string][]store.FishZone
 	fishZoneAt    time.Time
+
+	// 饵效控速：名册级食性聚合缓存（statLoc -> 拟饵/天然饵食性最大权重），
+	// 每条目独立 30 秒 TTL（对齐 tunables 热更节奏）；reload/invalidate 时
+	// 整体清空。零值可用，首用时建表。
+	paceDietMu    sync.Mutex
+	paceDietByLoc map[string]paceDietCacheEntry
 
 	// 运行参数缓存
 	tunMu    sync.Mutex
@@ -132,6 +150,20 @@ type Server struct {
 func NewServer(cfg config.Game, log *slog.Logger, obs *metrics.Server) *Server {
 	reg := obsRegistry(obs)
 	initMetrics(reg)
+	if cfg.Weather.Randomize {
+		seed, err := InitWeatherSchedule(WeatherScheduleOptions{
+			Randomize: true,
+			CycleDays: cfg.Weather.CycleDays,
+		})
+		if err != nil {
+			log.Warn("天气序列初始化失败，沿用地图模板", "err", err)
+		} else {
+			log.Info("天气序列已随机生成",
+				"seed", seed, "cycle_days", normalizeWeatherCycleDays(cfg.Weather.CycleDays))
+		}
+	} else {
+		clearRandomWeatherSchedule()
+	}
 	s := &Server{
 		cfg:             cfg,
 		log:             log,

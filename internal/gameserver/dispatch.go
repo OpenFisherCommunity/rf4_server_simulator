@@ -51,6 +51,8 @@ func (c *Ctx) ArgInt(i int) (uint64, bool) {
 
 // AfterResponse 注册响应发送后的回调。请求回执路径会先持久化并发送应答，
 // 再执行回调，确保技能树/背包推送不会抢在应答之前。
+// 注意：expect=false（不回包）的 handler 走 sendRequestResult 早退分支，
+// 注册的回调不会执行——无回包命令要推送请直接推，勿走本函数。
 func (c *Ctx) AfterResponse(fn func()) {
 	if c != nil && fn != nil {
 		c.afterResponse = append(c.afterResponse, fn)
@@ -154,6 +156,17 @@ func (d *Dispatch) lookup(main, sub uint8) Handler {
 // handleEnvelopePayload 处理网关转发来的明文信封（marker -1 请求；-2 是客户端对推送的
 // 响应不存在——客户端不发 -2，收到即记日志丢弃）。
 func (s *Server) handleEnvelopePayload(sess *Session, payload []byte) {
+	// 网关读循环里还有会话映射、信封解析等前置步骤，panic 同样会带走主服；
+	// 这一层只兜底记录，请求执行中的 panic 由 executeRequest 转成失败响应。
+	defer func() {
+		if r := recover(); r != nil {
+			if sess != nil {
+				requestPanicLog(sess.log, r)
+			} else {
+				requestPanicLog(s.log, r)
+			}
+		}
+	}()
 	env, ok := proto.ParseEnvelope(payload)
 	if !ok {
 		// 解析不了就把原字节带上：客户端的切换窝料等动作会落在这里，

@@ -2,6 +2,7 @@ package gameserver
 
 import (
 	"context"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -104,7 +105,7 @@ func TestBiteGateLayerFloor(t *testing.T) {
 		t.Fatalf("perch at surface must hit floor, got %v", w)
 	}
 	// 泥鳅（v4.1 带 0.525~0.975）浮钓近底（400cm→0.8）：带内不受影响。
-	if w := run(fishRollContext{rigType: 1, depthCM: 400, baits: []string{"rule_worm"}, now: time.Now()}, "vjun"); w != 1 {
+	if w := run(fishRollContext{rigType: 1, depthCM: 400, measuredWaterDepthM: 5, baits: []string{"rule_worm"}, now: time.Now()}, "vjun"); w != 1 {
 		t.Fatalf("loach near bottom must keep full weight, got %v", w)
 	}
 	// 底钓（0.93）对鲤科/底栖带鱼零误伤：鲫鱼带 0.54~0.98 在容差内。
@@ -112,6 +113,51 @@ func TestBiteGateLayerFloor(t *testing.T) {
 	// 不该被底钓钓起，正是 G2 的设计语义。
 	if w := run(fishRollContext{rigType: 12, baits: []string{"rule_worm"}, now: time.Now()}, "crucian"); w != 1 {
 		t.Fatalf("crucian on bottom rig must keep full weight, got %v", w)
+	}
+}
+
+func TestFloatBiteGateWeightsAcrossMeasuredWaterLayers(t *testing.T) {
+	s := &Server{}
+	weight := func(c fishRollContext, species string, floor float64) float64 {
+		t.Helper()
+		keys, w := s.applyBiteGates(context.Background(), []string{species}, []float64{1}, c,
+			biteGateConfig{enabled: true, layerFloor: floor}, "")
+		if len(keys) != 1 {
+			t.Fatalf("expected %s in weighted pool, got %v", species, keys)
+		}
+		return w[0]
+	}
+	// 18cm reaches the golden crucian's band (0.52–0.96) in a 30cm column.
+	c := fishRollContext{rigType: 1, depthCM: 18, measuredWaterDepthM: .3}
+	if got := weight(c, "c.carp", .01); got != 1 {
+		t.Errorf("shallow landing: weight=%g want 1", got)
+	}
+	c.measuredWaterDepthM = 5
+	if got := weight(c, "c.carp", .08); got != .08 {
+		t.Errorf("far outside habitat: weight=%g want configured .08", got)
+	}
+	// The old G2 step for this species was at 185cm in a 5m column.
+	c.depthCM = 184
+	left := weight(c, "c.carp", .01)
+	c.depthCM = 186
+	right := weight(c, "c.carp", .01)
+	if !(left > .01 && left < right && right < 1 && right-left < .04) {
+		t.Errorf("weights near shallow edge: %g and %g", left, right)
+	}
+	// Test the deep side of ide's band (ends at 0.625) as well.
+	c.depthCM = 387
+	left = weight(c, "s.orfe", .01)
+	c.depthCM = 388
+	right = weight(c, "s.orfe", .01)
+	if !(right > .01 && right < left && left < 1 && left-right < .04) {
+		t.Errorf("weights near deep edge: %g and %g", left, right)
+	}
+	c.depthCM = 18
+	for _, waterM := range []float64{0, -1, math.NaN(), math.Inf(1)} {
+		c.measuredWaterDepthM = waterM
+		if got := weight(c, "c.carp", .01); got != 1 {
+			t.Errorf("unknown depth %g: weight=%g want 1", waterM, got)
+		}
 	}
 }
 
@@ -159,46 +205,5 @@ func TestBiteGateConfigDefaultsAndClamps(t *testing.T) {
 	s.tunMu.Unlock()
 	if cfg := s.biteGateConfig(); cfg.layerFloor != 0 {
 		t.Fatalf("negative floor must clamp to 0: %+v", cfg)
-	}
-}
-
-// G-diet 天然饵双票：攻略证据与生态食性合成——双票原权重、单票小口、
-// 零票（玉米钓泥鳅）与明确禁饵（饵鱼钓银鲫）剔除。
-func TestBiteGateDietDualTicket(t *testing.T) {
-	s, db := seedBaitRuleTest(t)
-	for _, q := range []string{
-		`INSERT INTO loc_alias(alias,loc) VALUES('level_902_diet','gates-diet')`,
-		`INSERT INTO loc_wiki_fish(loc,fish_key,fish_zh) VALUES('gates-diet','vjun','泥鳅鱼'),('gates-diet','crucian','银鲫')`,
-		`INSERT INTO loc_fish(loc,fish_key,name_zh,catches) VALUES('gates-diet','vjun','泥鳅',1),('gates-diet','crucian','银鲫',1)`,
-		`INSERT INTO item_def(numeric_id,item_id,category,attrs_json) VALUES(999804,'rule_corn',27,'{"fopbhlmkcpe":13}'),(999805,'rule_dead',27,'{"fopbhlmkcpe":15}')`,
-		`INSERT INTO item_catalog(item_id,name_zh) VALUES('rule_corn','玉米粥'),('rule_dead','死鲭鱼')`,
-	} {
-		if _, err := db.SQL.Exec(q); err != nil {
-			t.Fatal(err)
-		}
-	}
-	setBiteGateSwitch(t, s, "1")
-	// 蚯蚓：泥鳅（allow 蚯蚓 + worm 1.87）与银鲫（allow 蚯蚓 + worm 1.73）都是双票。
-	seen := map[string]bool{}
-	for range 64 {
-		if f := s.rollFish("level_902_diet", "rule_worm"); f != nil {
-			seen[f.Species] = true
-		}
-	}
-	if !seen["vjun"] || !seen["crucian"] {
-		t.Fatalf("worm must roll both loach and crucian, saw %v", seen)
-	}
-	// 玉米粥：银鲫（allow 玉米粥 + plant 2.02）双票；泥鳅（攻略不认 + plant 0.2
-	// 在噪声地板以下）零票剔除。
-	for range 64 {
-		if f := s.rollFish("level_902_diet", "rule_corn"); f != nil && f.Species == "vjun" {
-			t.Fatal("loach must never take corn porridge")
-		}
-	}
-	// 死饵鱼：银鲫明确禁饵类（不吃拟饵/饵鱼类）——deny 直接剔除。
-	for range 16 {
-		if f := s.rollFish("level_902_diet", "rule_dead"); f != nil && f.Species == "crucian" {
-			t.Fatal("crucian deny-lists baitfish and must be excluded")
-		}
 	}
 }

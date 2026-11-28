@@ -101,7 +101,9 @@ func hItemMove(ctx *Ctx) ([]byte, bool) {
 	cctx := ctx.Sess.pushCtx()
 	houseCap := int64(houseContainerCapacity)
 	if dst == "house" {
-		houseCap, _ = srv.importedContainerCapacity(cctx, ctx.Sess.Userid, dstKind, houseCap, 0)
+		// 目标物理落库始终是 house（容器 10）；客户端传来的 14 只是奖赏
+		// 分组投影，不能拿它的导入容量覆盖房屋上限。
+		houseCap, _ = srv.importedContainerCapacity(cctx, ctx.Sess.Userid, 10, houseCap, 0)
 	}
 	tx, err := beginEconomyTx(cctx, srv.DB)
 	if err != nil {
@@ -228,6 +230,9 @@ func hItemUse(ctx *Ctx) ([]byte, bool) {
 		return body, true
 	}
 	if body, handled := srv.useGiftBox(ctx); handled {
+		return body, true
+	}
+	if body, handled := srv.useMembershipItem(ctx); handled {
 		return body, true
 	}
 	guids := deepGUIDs(ctx.Tree)

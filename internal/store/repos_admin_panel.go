@@ -82,6 +82,9 @@ type FishConfigRow struct {
 	Weight      float64 `json:"weight"`
 	Enabled     bool    `json:"enabled"`
 	HasOverride bool    `json:"has_override"`
+	// WeightSource 标记该行权重的来源：official=rf4info 周档统计，manual=后台人工覆盖，
+	// static=未覆盖（用鱼库静态渔获数）。
+	WeightSource string `json:"weight_source"`
 
 	// 鱼饵规则覆盖带来的轮换信息（来自 fish_bait_override）。
 	// 钓场鱼口页需要看出"这个鱼种配了轮换、当前生效哪一组"，
@@ -105,10 +108,11 @@ type FishBiteSetting struct {
 }
 
 type FishWeightOverride struct {
-	Loc     string
-	FishKey string
-	Weight  float64
-	Enabled bool
+	Loc       string
+	FishKey   string
+	Weight    float64
+	Enabled   bool
+	UpdatedBy string
 }
 
 type AdminFishConfig struct {
@@ -320,12 +324,23 @@ func (d *DB) ListAdminStores(ctx context.Context) ([]*AdminStoreView, error) {
 	}
 	sort.Strings(storeIDs)
 
+	// 通用地图钓鱼站共享的价格表只汇总一次，避免 205 家店重复遍历实录。
+	fishingPrices, err := d.loadFishingPrices(ctx, catalog, recorded)
+	if err != nil {
+		return nil, err
+	}
+
 	out := make([]*AdminStoreView, 0, len(storeIDs))
 	for _, storeID := range storeIDs {
 		base, source, def, known := resolveShopBase(storeID, catalog, recorded)
 		base, _, err = d.augmentShopShelf(ctx, def, base)
 		if err != nil {
 			return nil, err
+		}
+		// 与 effectiveShopShelf 保持一致：补齐商品之后再补缺失价格，
+		// 否则运行时补出来的商品（如只在 02 有银价的款式）补不到。
+		if known && def.Kind == 0 && len(def.Brands) == 0 {
+			fillMissingPrices(base, fishingPrices)
 		}
 		overrides := allOverrides[storeID]
 		effective := applyShopOverrides(base, overrides)
@@ -408,6 +423,10 @@ func (d *DB) loadAdminShopItemMeta(ctx context.Context, itemIDs []string) (map[s
 }
 
 func (d *DB) ListAdminStoreItems(ctx context.Context, storeID, query string, limit int) ([]*AdminStoreItemView, error) {
+	return d.ListAdminStoreItemsFiltered(ctx, storeID, query, limit, false)
+}
+
+func (d *DB) ListAdminStoreItemsFiltered(ctx context.Context, storeID, query string, limit int, overridesOnly bool) ([]*AdminStoreItemView, error) {
 	storeID = strings.TrimSpace(storeID)
 	if storeID == "" {
 		return nil, fmt.Errorf("store_id 不能为空")
@@ -446,6 +465,9 @@ func (d *DB) ListAdminStoreItems(ctx context.Context, storeID, query string, lim
 			continue
 		}
 		_, hasOverride := shelf.Overrides[row.ItemID]
+		if overridesOnly && !hasOverride {
+			continue
+		}
 		out = append(out, &AdminStoreItemView{
 			StoreID:     storeID,
 			ItemID:      row.ItemID,
@@ -579,6 +601,10 @@ func (d *DB) GetAdminFishConfig(ctx context.Context, loc string) (*AdminFishConf
 	if err != nil {
 		return nil, err
 	}
+	base, err := d.FishWeightBase(ctx, loc)
+	if err != nil {
+		return nil, err
+	}
 	// 鱼饵规则覆盖：钓场页要展示每个鱼种的轮换配置与当前生效组。
 	// 读失败不阻断鱼口编辑（鱼饵规则是附加信息），降级为无轮换。
 	baitOvs := map[string]FishBaitOverride{}
@@ -610,9 +636,13 @@ func (d *DB) GetAdminFishConfig(ctx context.Context, loc string) (*AdminFishConf
 		if name == "" {
 			name = r.FishKey
 		}
-		row := FishConfigRow{FishKey: r.FishKey, NameZh: name, BaseWeight: r.Catches, Weight: r.Catches, Enabled: true}
+		row := FishConfigRow{FishKey: r.FishKey, NameZh: name, BaseWeight: r.Catches, Weight: r.Catches, Enabled: true, WeightSource: "static"}
+		if bw, ok := base[r.FishKey]; ok {
+			row.BaseWeight = bw.Weight
+		}
 		if ov, ok := ovs[r.FishKey]; ok {
 			row.Weight, row.Enabled, row.HasOverride = ov.Weight, ov.Enabled, true
+			row.WeightSource = weightSourceOf(ov)
 		}
 		applyBaitRotation(&row, baitOvs[name])
 		cfg.Fish = append(cfg.Fish, row)
@@ -628,7 +658,10 @@ func (d *DB) GetAdminFishConfig(ctx context.Context, loc string) (*AdminFishConf
 		}
 		row := FishConfigRow{
 			FishKey: key, NameZh: name, BaseWeight: 0, Weight: ov.Weight,
-			Enabled: ov.Enabled, HasOverride: true,
+			Enabled: ov.Enabled, HasOverride: true, WeightSource: weightSourceOf(ov),
+		}
+		if bw, ok := base[key]; ok {
+			row.BaseWeight = bw.Weight
 		}
 		applyBaitRotation(&row, baitOvs[name])
 		cfg.Fish = append(cfg.Fish, row)
@@ -705,7 +738,9 @@ func (d *DB) SaveAdminFishConfig(ctx context.Context, in FishConfigSave, updated
 			VALUES(?,?,?,?,?,?)
 			ON CONFLICT(loc,fish_key) DO UPDATE SET
 				weight=excluded.weight, enabled=excluded.enabled,
-				updated_ts=excluded.updated_ts, updated_by=excluded.updated_by`,
+				updated_ts=excluded.updated_ts, updated_by=excluded.updated_by
+			WHERE abs(fish_weight_override.weight-excluded.weight) > 1e-9
+			   OR fish_weight_override.enabled <> excluded.enabled`,
 			in.Area, f.FishKey, f.Weight, boolInt(f.Enabled), now, updatedBy); err != nil {
 			return err
 		}
@@ -725,15 +760,25 @@ func (d *DB) ResetAdminFishConfig(ctx context.Context, loc string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fish_weight_override WHERE loc=?`, loc); err != nil {
 		return err
 	}
+	// 有统计基线时，「恢复默认」回到基线，而不是退回静态渔获数；旧库没有基线才保留静态回退。
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO fish_weight_override(loc,fish_key,weight,enabled,updated_ts,updated_by)
+		SELECT b.loc,b.fish_key,b.weight,1,b.updated_ts,'rf4info'
+		  FROM fish_weight_base b
+		  JOIN loc_wiki_fish w ON w.loc=b.loc AND w.fish_key=b.fish_key
+		 WHERE b.loc=?`, loc); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fish_bite_setting WHERE loc=?`, loc); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (d *DB) FishWeightOverrides(ctx context.Context, loc string) (map[string]FishWeightOverride, error) {
+// FishWeightBase 读取某水域的 rf4info 周档统计基线权重（迁移 00072 建立，不受人工覆盖影响）。
+func (d *DB) FishWeightBase(ctx context.Context, loc string) (map[string]FishWeightOverride, error) {
 	rows, err := d.SQL.QueryContext(ctx, `
-		SELECT loc,fish_key,weight,enabled FROM fish_weight_override WHERE loc=?`, loc)
+		SELECT loc,fish_key,weight,1,COALESCE(updated_by,'') FROM fish_weight_base WHERE loc=?`, loc)
 	if err != nil {
 		return nil, err
 	}
@@ -742,13 +787,42 @@ func (d *DB) FishWeightOverrides(ctx context.Context, loc string) (map[string]Fi
 	for rows.Next() {
 		var v FishWeightOverride
 		var enabled int
-		if err := rows.Scan(&v.Loc, &v.FishKey, &v.Weight, &enabled); err != nil {
+		if err := rows.Scan(&v.Loc, &v.FishKey, &v.Weight, &enabled, &v.UpdatedBy); err != nil {
 			return nil, err
 		}
 		v.Enabled = enabled != 0
 		out[v.FishKey] = v
 	}
 	return out, rows.Err()
+}
+
+func (d *DB) FishWeightOverrides(ctx context.Context, loc string) (map[string]FishWeightOverride, error) {
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT loc,fish_key,weight,enabled,COALESCE(updated_by,'') FROM fish_weight_override WHERE loc=?`, loc)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]FishWeightOverride{}
+	for rows.Next() {
+		var v FishWeightOverride
+		var enabled int
+		if err := rows.Scan(&v.Loc, &v.FishKey, &v.Weight, &enabled, &v.UpdatedBy); err != nil {
+			return nil, err
+		}
+		v.Enabled = enabled != 0
+		out[v.FishKey] = v
+	}
+	return out, rows.Err()
+}
+
+// weightSourceOf 把覆盖行的写入者翻译成前端能直接展示的来源标签。
+// 迁移写入的行 updated_by='rf4info'，后台手改的行是管理员账号。
+func weightSourceOf(ov FishWeightOverride) string {
+	if ov.UpdatedBy == "rf4info" {
+		return "official"
+	}
+	return "manual"
 }
 
 func boolInt(v bool) int64 {

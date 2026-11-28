@@ -13,6 +13,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -89,8 +90,8 @@ func (l adminLogger) Error(msg string, args ...any) { l.l.Error(logMessage(msg, 
 func main() {
 	configPath := flag.String("config", "config.yaml", "配置文件路径")
 	panelAddr := flag.String("panel-addr", "127.0.0.1:9500", "控制面板监听地址（仅本机）")
-	adminUser := flag.String("admin-user", "admin", "初始管理员用户名（表空时生效）")
-	adminPass := flag.String("admin-pass", "admin123", "初始管理员密码（表空时生效）")
+	adminUser := flag.String("admin-user", "", "初始管理员用户名（默认取配置 admin.username）")
+	adminPass := flag.String("admin-pass", "", "初始管理员密码（默认取配置 admin.password）")
 	staticDB := flag.String("static-db", "", "静态配置库路径（默认取 sqlite.static_path）")
 	flag.Parse()
 
@@ -132,11 +133,21 @@ func main() {
 		http.Redirect(w, r, "/admin/", http.StatusTemporaryRedirect)
 	})
 	mux.HandleFunc("/api/admin/retry", app.handleAdminRetry)
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 页面壳按语言改写：?lang= > cookie lang > Accept-Language > 默认 zh（panel_lang.go）
+		lang, fromQuery := panelLangFromRequest(r)
+		if fromQuery {
+			http.SetCookie(w, &http.Cookie{
+				Name: "lang", Value: lang, Path: "/", MaxAge: panelLangCookieMaxAge, SameSite: http.SameSiteLaxMode,
+			})
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(panelHTML)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Vary", "Cookie, Accept-Language")
+		_, _ = w.Write(renderPanel(panelHTML, lang))
 	})
 	mux.HandleFunc("/api/status", app.handleStatus)
+	mux.HandleFunc("/api/overview", app.handleOverview)
 	mux.HandleFunc("/api/logs", app.handleLogs)
 	mux.HandleFunc("/api/start", app.actionHandler("start"))
 	mux.HandleFunc("/api/stop", app.actionHandler("stop"))
@@ -164,7 +175,14 @@ func main() {
 	// ---- 首次初始化（幂等）----
 	if seed.NeedsSeed(cfg, *staticDB) {
 		app.log.Info("正在初始化数据库（首跑需导入静态配置，请稍候）…")
-		res, err := seed.Ensure(context.Background(), cfg, *staticDB, *adminUser, *adminPass, app.log)
+		seedUser, seedPass := cfg.Admin.EffectiveCredentials()
+		if *adminUser != "" {
+			seedUser = *adminUser
+		}
+		if *adminPass != "" {
+			seedPass = *adminPass
+		}
+		res, err := seed.Ensure(context.Background(), cfg, *staticDB, seedUser, seedPass, app.log)
 		if err != nil {
 			showFatal("数据库初始化失败", err)
 			return
@@ -172,13 +190,16 @@ func main() {
 		app.log.Info(fmt.Sprintf("初始化完成 seeded=%v tables=%d admin_created=%v elapsed=%s",
 			res.Seeded, res.Tables, res.AdminCreated, res.Elapsed.Round(time.Millisecond)))
 		if res.AdminCreated {
-			app.log.Warn("已创建默认管理员 admin/" + *adminPass + "，请尽快在管理后台修改")
+			app.log.Warn("已创建初始管理员 " + seedUser + "，密码取自配置 admin.password；发布包默认密码仅限本机使用")
 		}
 	}
 
 	// ---- 内嵌管理后台 ----
 	if err := app.initAdmin(app.ctx); err != nil {
 		app.log.Error("管理后台初始化失败: " + err.Error())
+	}
+	for _, warn := range cfg.Admin.WeakWarnings() {
+		app.log.Warn(warn)
 	}
 	updateTrayIcon(app)
 
@@ -377,6 +398,45 @@ func (a *app) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// handleOverview 控制中心首页的「后台信息」：只读统计，不需要登录管理后台。
+// 直接读的是管理后台同一个库（WAL 只读 COUNT，不写），读不到就留空由前端显示「未上报」。
+func (a *app) handleOverview(w http.ResponseWriter, r *http.Request) {
+	user, _ := a.cfg.Admin.EffectiveCredentials()
+	out := map[string]any{
+		"admin":      "/admin/",
+		"admin_user": user,
+		"host":       r.Host,
+	}
+	a.adminMu.RLock()
+	db := a.adminDB
+	a.adminMu.RUnlock()
+	if db == nil {
+		out["ready"] = false
+		writeJSON(w, out)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	var players, items, mails, audits int64
+	if err := db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM profile`).Scan(&players); err != nil {
+		out["ready"] = false
+		writeJSON(w, out)
+		return
+	}
+	_ = db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM item`).Scan(&items)
+	_ = db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM mail`).Scan(&mails)
+	_ = db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log`).Scan(&audits)
+	tunables, _ := db.TunableList(ctx)
+	out["ready"] = true
+	out["players"] = players
+	out["items"] = items
+	out["mails"] = mails
+	out["audits"] = audits
+	out["tunables"] = len(tunables)
+	out["db"] = "up"
+	writeJSON(w, out)
+}
+
 // handleHosts 面板 hosts 指向开关：GET 返回当前指向，POST ?mode=local|official 切换。
 func (a *app) handleHosts(w http.ResponseWriter, r *http.Request) {
 	path := hostsFilePath()
@@ -437,7 +497,7 @@ func (a *app) actionHandler(action string) http.HandlerFunc {
 			if name == "" {
 				a.sup.StopAll()
 			} else {
-				a.sup.StopOne(name)
+				err = a.sup.StopOne(name)
 			}
 		case "restart":
 			if name == "" {
@@ -449,7 +509,7 @@ func (a *app) actionHandler(action string) http.HandlerFunc {
 			}
 		}
 		if err != nil {
-			httpError(w, err.Error())
+			actionError(w, err)
 			return
 		}
 		w.WriteHeader(204)
@@ -477,10 +537,7 @@ func (a *app) initAdmin(ctx context.Context) error {
 		a.setAdminError(err)
 		return err
 	}
-	user, pass := a.cfg.Admin.Username, a.cfg.Admin.Password
-	if user == "" {
-		user, pass = "admin", "admin123"
-	}
+	user, pass := a.cfg.Admin.EffectiveCredentials()
 	if _, err := db.UpsertAdminPassword(ctx, user, pass); err != nil {
 		_ = db.Close()
 		a.setAdminError(err)
@@ -646,6 +703,18 @@ func httpError(w http.ResponseWriter, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(500)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// actionError 启停动作的错误响应。name 来自 query，未知进程是调用方输入问题，
+// 回 404 而不是 500：面板能直接提示"未知进程"，也不会被当成服务端故障。
+func actionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, supervisor.ErrUnknownProcess) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	httpError(w, err.Error())
 }
 
 // normalizeLocal ":9500"/"9500" → "127.0.0.1:9500"；host:port 原样返回。

@@ -791,30 +791,37 @@ func hSetQuivertip(ctx *Ctx) ([]byte, bool) {
 		ctx.Log.Warn("17/5 竿不属于当前玩家，已忽略", "竿", shortGUID(rodGUID))
 		return nil, true
 	}
-	_ = srv.DB.UpsertRodSetting(cctx, rodGUID, "quivertip", tip)
-	if fields, ferr := FieldsFromJSON(row.FieldsJSON); ferr == nil {
-		tidx := fieldIdxByCS(row.WireClass, "kjphlnnlflh")
-		if tidx >= 0 {
-			for len(fields) <= tidx {
-				zf, zerr := proto.ZeroField(fieldOpAt(row.WireClass, len(fields)))
-				if zerr != nil {
-					break
-				}
-				fields = append(fields, zf)
-			}
-			fields[tidx].Str = &tip
-			// 兼容旧版把 U32N 的字符串值写进 STR 标签；
-			// fields_json 读取会丢失 u32n 标签下的字符串。
-			fields[tidx].Op = "STR"
-			if fj, jerr := FieldsToJSON(fields); jerr == nil {
-				_ = srv.DB.UpdateItemFields(cctx, row.GUID, fj, row.Qty, row.Durability, row.Workmanship, row.RigGUID)
-			}
-		}
+	fields, err := FieldsFromJSON(row.FieldsJSON)
+	tidx := fieldIdxByCS(row.WireClass, csRigTip)
+	if err != nil || tidx < 0 {
+		return nil, false
 	}
+	if len(fields) < len(wiregen.ClassOps[row.WireClass]) {
+		fields = alignFieldsToOps(row, fields)
+	}
+	if tidx >= len(fields) {
+		return nil, false
+	}
+	// 快照用 STR 保存字符串，线上编码仍按竿类的 U32N。
+	fields[tidx] = proto.FStr("STR", &tip)
+	bumpCreatedTicks(fields, row.WireClass)
+	fj, err := FieldsToJSON(fields)
+	if err != nil {
+		return nil, false
+	}
+	if err = srv.DB.UpsertRodSetting(cctx, rodGUID, "quivertip", tip); err == nil {
+		err = srv.DB.UpdateItemFields(cctx, row.GUID, fj, row.Qty, row.Durability, row.Workmanship, row.RigGUID)
+	}
+	if err != nil {
+		ctx.ReplyFailure("System.IO.IOException", "竿稍设置保存失败")
+		return nil, true
+	}
+	row.FieldsJSON = fj
 	// 响应 800，Field 1（更新段）= 刚更新的竿实例。
 	if tree, terr := srv.ItemToTree(cctx, row); terr == nil {
 		body, encErr := proto.EncodeValue(build800(proto.Null(), proto.Args(proto.S("61"), tree), proto.Null()), ctx.Sess.Table())
 		if encErr == nil {
+			srv.pushRodModelRefresh(ctx, row.GUID)
 			return body, true
 		}
 	}
@@ -875,51 +882,46 @@ func hCastPrepare(ctx *Ctx) ([]byte, bool) {
 	}
 	// 新竿/换钓组后的第一杆：先按实际竿行算 rigType 再做路亚族的重置与种子，
 	// 否则旧 st.RigType（0 或换钓组前的残留）会让第一杆丢种子（复审 P2）。
-	newRigType := st.RigType
-	var rodRow *store.Item
-	if row, err := srv.DB.GetItemByGUID(ctx.Sess.pushCtx(), gear); err == nil && row != nil {
-		rodRow = row
-		if row.Durability > 0 {
-			newRigType = srv.rigTypeOfItem(ctx.Sess.pushCtx(), row)
-		}
-	}
 	st.mu.Lock()
+	rodRow, tipRepaired, _ := srv.prepareCastRodLocked(ctx, st, gear)
 	st.GearGuid = gear
 	st.ReelSetting = reelSpeed
-	st.RigType = newRigType
 	// 新一杆无条件清上一杆拟饵状态：换竿/换饵/同竿换钓组后旧 LureDive 不得
 	// 钳制新饵，旧 LureLayer 不得压过 runtime DiveDepth 兜底，旧 LureAction/
-	// LureMotionMask 也不得漏进非路亚判鱼（评审 P1/P2-1）。
+	// LureMotionMask/LureType 也不得漏进非路亚判鱼（评审 P1/P2-1）。
 	st.LureMotionMask = 0
 	st.LureAction = ""
 	st.LureLayer = 0 // 0=未知：无运动证据时判鱼走 runtime DiveDepth 兜底，不再恒走 .5
 	st.LureDive = 0
+	st.LureType = ""
 	st.LurePulseCount = 0
 	st.LurePulseAt = time.Time{}
 	st.LureToggleCount = 0
 	st.LureToggleAt = time.Time{}
 	st.LureStateAt = time.Time{}
 	st.LureLayerAt = time.Time{}
+	resetMarineLayerLocked(st)
 	depthCM := st.DepthCM
-	rigType := newRigType
+	rigType := st.RigType
 	st.mu.Unlock()
 	if err := ctx.Sess.prepareBaitForCast(st, gear); err != nil {
 		ctx.Log.Warn("抛竿前补饵失败", "err", err)
 		return nil, false
 	}
-	// 路亚抛竿：按补饵后的实际装配取拟饵名义泳层，种子进实时水层——
-	// 落水瞬间饵在设计泳层，之后由 14/7 运动位动态修正并受该值钳制。
+	// 路亚抛竿：按补饵后的实际装配取拟饵名义泳层与类型名，种子进实时水层与
+	// pace 复合分——落水瞬间饵在设计泳层，之后由 14/7 运动位动态修正并受该值
+	// 钳制；动作权重按主导拟饵（最深）的类型计。
 	if rigTypeLureFamily[rigType] {
-		if dive := srv.lureDiveForGear(ctx.Sess.pushCtx(), gear); dive > 0 {
-			st.mu.Lock()
+		dive, lureType := srv.lureCoreForGear(ctx.Sess.pushCtx(), gear)
+		st.mu.Lock()
+		if dive > 0 {
 			st.LureDive = dive
 			st.LureLayer = dive
-			st.mu.Unlock()
 		}
+		st.LureType = lureType
+		st.mu.Unlock()
 	}
-	// 收敛钓组数据：补齐 f5、rig 行、组件和尖梢。
-	// 尖梢有更新时推送 4/22 全量竿树，因为客户端抛竿前会校验实例 f8。
-	if srv.ensureRig(ctx.Sess.pushCtx(), ctx.Sess.Userid, gear) {
+	if tipRepaired {
 		ctx.Sess.Push4_22Full()
 	}
 	if rodRow != nil {
@@ -999,28 +1001,19 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 			st.Spot = spot
 		}
 	}
-	castX, castZ, hasCastPos := castLandingPosition(ctx.Tree)
+	castX, castZ, hasCastPos := castLandingPosition(ctx.Tree, st.Loc)
 	st.GearGuid = gear
 	st.CastPosX, st.CastPosZ, st.HasCastPos = castX, castZ, hasCastPos
+	row, _ := srv.DB.GetItemByGUID(ctx.Sess.pushCtx(), gear)
+	broken := row != nil && row.Durability <= 0
+	if broken {
+		st.GearGuid = ""
+	}
 	st.mu.Unlock()
-
-	// 记录钓组类型并读取当前钩上饵；路亚使用独立的咬钩节奏。
-	rigType := int64(0)
-	if row, err := srv.DB.GetItemByGUID(ctx.Sess.pushCtx(), gear); err == nil && row != nil {
-		if row.Durability <= 0 {
-			// 断竿不可抛投：耐久归零只能修理，17/7 拒取后客户端仍可能直发 14/2。
-			st.mu.Lock()
-			st.GearGuid = ""
-			st.mu.Unlock()
-			ctx.Log.Info("14/2 被拒：鱼竿已损坏", "rod", shortGUID(gear))
-			ctx.ReplyFailure("System.InvalidOperationException", "鱼竿已损坏，请先修理")
-			return nil, true
-		}
-		rt := srv.rigTypeOfItem(ctx.Sess.pushCtx(), row)
-		rigType = rt
-		st.mu.Lock()
-		st.RigType = rt
-		st.mu.Unlock()
+	if broken {
+		ctx.Log.Info("14/2 被拒：鱼竿已损坏", "rod", shortGUID(gear))
+		ctx.ReplyFailure("System.InvalidOperationException", "鱼竿已损坏，请先修理")
+		return nil, true
 	}
 	// 水域装备限制：竿或已装渔轮被当前地图禁用时不可抛投
 	// （17/7 已拦正常路径，这里兜底已装配好才切图的情况）。
@@ -1046,7 +1039,13 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 		ctx.Log.Warn("抛竿前补饵失败", "err", err)
 		return nil, false
 	}
-	srv.ensureRig(ctx.Sess.pushCtx(), ctx.Sess.Userid, gear)
+	st.mu.Lock()
+	row, _, _ = srv.prepareCastRodLocked(ctx, st, gear)
+	rigType := int64(0)
+	if row != nil {
+		rigType = st.RigType
+	}
+	st.mu.Unlock()
 	// 14/1 给出的是满力度上限；14/2 才携带本次实际落点、动作和出手力度。
 	// 这里只做真实请求诊断，不能把本杆力度写回下一杆的上限。
 	requestedM := throwDistance(ctx.Tree)
@@ -1074,6 +1073,13 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 		ctx.Log.Info("抛投请求超满竿上限，按上限收口",
 			"requested_m", math.Round(requestedM*100)/100, "capped_m", math.Round(actionMaxM*100)/100)
 		castM = actionMaxM
+	}
+	if profile.ClipLimitM > 0 && castM > profile.ClipLimitM {
+		// 轮管卡是机械止线：客户端按竿树 153.f5 自行截停，落点坐标不会
+		// 超过卡米数；requested（红区）仍可能超卡，实测距离以卡米为准。
+		ctx.Log.Info("抛投请求超轮管卡，按卡米截停",
+			"requested_m", math.Round(castM*100)/100, "clip_m", math.Round(profile.ClipLimitM*100)/100)
+		castM = profile.ClipLimitM
 	}
 	st.mu.Lock()
 	st.Bait = bait
@@ -1139,7 +1145,7 @@ func findObjU32(root *proto.Value, class string) uint64 {
 
 // castLandingPosition 读取 14/2 olieodeoaof.f6/f7 的实际抛竿落点。
 // 这两列在 wire 上以 U32 承载 F32 位型。
-func castLandingPosition(root *proto.Value) (float64, float64, bool) {
+func castLandingPosition(root *proto.Value, loc string) (float64, float64, bool) {
 	obj := findObj(root, "olieodeoaof")
 	if obj == nil {
 		return 0, 0, false
@@ -1157,6 +1163,15 @@ func castLandingPosition(root *proto.Value) (float64, float64, bool) {
 	z := float64(math.Float32frombits(uint32(u64Of(zf.Num))))
 	if math.IsNaN(x) || math.IsNaN(z) || math.IsInf(x, 0) || math.IsInf(z, 0) {
 		return 0, 0, false
+	}
+	if strings.HasPrefix(loc, "loc12_") || loc == "level_012_north_sea" {
+		pose := obj.Field(10).Val
+		if pose == nil || pose.Class != "deggnlnohoh" || pose.Field(0).Num == nil || pose.Field(2).Num == nil || obj.Field(0).Num == nil {
+			return 0, 0, false
+		}
+		px := float64(math.Float32frombits(uint32(*pose.Field(0).Num)))
+		pz := float64(math.Float32frombits(uint32(*pose.Field(2).Num)))
+		return seaChartLanding(x, z, px, pz, throwDistance(obj))
 	}
 	return x, z, true
 }
@@ -1252,8 +1267,12 @@ func hFishingStep(ctx *Ctx) ([]byte, bool) {
 			st.LastAnim = anim
 			previousMask := st.LureMotionMask
 			st.LureMotionMask = anim
-			if rigTypeLureFamily[st.RigType] {
-				now := time.Now()
+			isLure := rigTypeLureFamily[st.RigType]
+			now := time.Now()
+			if marineRigType(st.RigType) {
+				ctx.Sess.Srv.updateMarineLayerLocked(st, anim, now)
+			}
+			if isLure {
 				if anim != previousMask || st.LureLayerAt.IsZero() || now.Sub(st.LureLayerAt) >= 1500*time.Millisecond {
 					st.LureLayer = lureLayerFromMotion(anim, st.LureLayer, st.LureDive)
 					st.LureLayerAt = now
@@ -1278,6 +1297,7 @@ func hFishingStep(ctx *Ctx) ([]byte, bool) {
 					ctx.Log.Warn("入水窝料扣减失败", "err", err)
 					st.mu.Lock()
 					st.InWater = false
+					resetMarineLayerLocked(st)
 					st.mu.Unlock()
 					return nil, true
 				}
@@ -1288,6 +1308,12 @@ func hFishingStep(ctx *Ctx) ([]byte, bool) {
 			} else if enterWater {
 				ctx.Log.Info("钓组在水中", "rod", shortGUID(st.GearGuid), "f5", fmt.Sprintf("0x%X", anim))
 			}
+			// pace 开启时动作复合档位升高 → 立即按新档重排咬钩（只升不降，
+			// 内部自持锁与守卫复核；好动作一出来即进对应等待窗，见
+			// specs/changes/lure-action-pace/spec.md）。
+			if isLure {
+				ctx.Sess.Srv.paceLureActionRearm(ctx.Sess, st)
+			}
 			// 14/7 每帧都会发送，仅在动画位变化时记录日志。
 			if changed {
 				stateAgeMS := time.Since(st.LureStateAt).Milliseconds()
@@ -1295,6 +1321,7 @@ func hFishingStep(ctx *Ctx) ([]byte, bool) {
 					"mask", fmt.Sprintf("0x%X", anim&lureMotionStatusMask),
 					"action", st.LureAction, "layer", st.LureLayer,
 					"layer_cm", st.effectiveBaitDepthCMLocked(time.Now()),
+					"marine_state", st.MarineState, "marine_layer", st.MarineLayer,
 					"speed", st.ReelSetting, "state_age_ms", stateAgeMS)
 			}
 		}
@@ -1357,7 +1384,8 @@ func hFishingPull(ctx *Ctx) ([]byte, bool) {
 	wasHooked := st.Hooked
 	pending, gear, rigType := st.Pending, st.GearGuid, st.RigType
 	castActive, resolved := st.CastActive, st.Resolved
-	if rigTypeLureFamily[rigType] {
+	isLure := rigTypeLureFamily[rigType]
+	if isLure {
 		st.recordLurePulseLocked(time.Now())
 	}
 	needsConfirmation := marineRigType(rigType) && pending != nil && castActive && !resolved && !pending.HookConfirmed
@@ -1381,6 +1409,11 @@ func hFishingPull(ctx *Ctx) ([]byte, bool) {
 		hookedFish, announce = st.takeHookedChatFishLocked()
 	}
 	st.mu.Unlock()
+	// pace 开启时动作复合档位升高 → 立即按新档重排咬钩（只升不降，内部自持
+	// 锁与守卫复核；海钓铁板的垂直抖法同样走这里）。
+	if isLure {
+		srv.paceLureActionRearm(ctx.Sess, st)
+	}
 	if needsConfirmation && nibble {
 		finishNibbleHook(ctx, st, pending, gear, castActive, resolved)
 		ctx.Log.Info("14/9 海钓嘬饵未中钩，重新排鱼", "rod", shortGUID(gear),
@@ -1396,11 +1429,17 @@ func hFishingPull(ctx *Ctx) ([]byte, bool) {
 		if ctx.Sess.marineHookConfirm() {
 			bound = ctx.Sess.Push14_15(gear, pending.FishGUID)
 		} else if !ctx.Sess.marineHookItemSync() {
-			ctx.Log.Info("14/9 海钓抬竿只走真服 14/11 路径，跳过 14/15/4/22")
+			ctx.Log.Info("14/9 海钓抬竿走真服 14/11 口径，只补中鱼钩挂载位")
 		}
 		if ctx.Sess.marineHookItemSync() {
 			ctx.Sess.Push4_22Hook(false, gear)
 		}
+		// 海钓 14/9 是实际刺鱼入口，客户端不一定再补发 14/11（见本函数开头）。
+		// 若只走这条路径，多钩倒钓臂（1001/1005/1009）同样需要按鱼实际咬的钩
+		// 补挂竿运行位，否则客户端仍把鱼挂到线末端钩、中鱼钩留在水下。
+		// 这里只发单钩帧（与 14/11 钩帧同形状），不重建竿树，不会触发
+		// “扣饵 4/21 + 竿树同步打断搏鱼 ctor”的秒脱问题。
+		ctx.Sess.pushFightHookMounted(gear, pending)
 		ctx.Log.Info("14/9 海钓抬竿确认", "rod", shortGUID(gear), "fish", shortGUID(pending.FishGUID),
 			"rig_type", rigType, "14/15", bound)
 	} else if reconfirm {
@@ -1496,17 +1535,14 @@ func hFishingHooked(ctx *Ctx) ([]byte, bool) {
 	if pending == nil && !resolved && castActive {
 		srv.scheduleBiteForHooked(ctx.Sess, st)
 	}
-	if pending != nil && marineRigType(rigType) && !wasHooked {
-		// 官方抓包（2026-11-11）海钓 14/11 后有钩 4/22（串钩=嵌套容器、
-		// 单钩=裸钩，挂竿位同四钓法口径）；14/15 仍是"鱼离场"分支，继续默认不推。
-		if ctx.Sess.marineHookConfirm() {
-			ctx.Sess.Push14_15(gear, pending.FishGUID)
-		}
-		ctx.Sess.Push4_22Hook(true, gear)
-	} else {
-		// 挂竿位四钓法通用（官方抓包沉底/浮钓/海钓/路亚中鱼钩 flags 均含 1024）。
-		ctx.Sess.Push4_22Hook(true, gear)
+	if pending != nil && marineRigType(rigType) && !wasHooked && ctx.Sess.marineHookConfirm() {
+		// 14/15 仍是"鱼离场"分支，继续默认不推。
+		ctx.Sess.Push14_15(gear, pending.FishGUID)
 	}
+	// 挂竿位四钓法通用（官方抓包沉底/浮钓/海钓/路亚中鱼钩 flags 均含 1024）。
+	// 多钩钓组必须按本杆实际中鱼的钩补位：线末端钩不一定是鱼咬的那枚
+	// （倒钓臂 1001/1005/1009），否则鱼模型会挂到线末端钩上、中鱼钩留水下。
+	ctx.Sess.pushFightHookMounted(gear, pending)
 	// 中鱼即进搏鱼态：客户端搏鱼 ctor 一次性读取全部挂载态并锁定整场，
 	// 竿/线/轮/前导的运行位必须当刻可达——只等结算再推对秒脱来说已经晚了
 	// （官方搏鱼期每 2s 全树帧同口径）。紧随钩帧发一次全树运行位同步；
@@ -1794,6 +1830,8 @@ func hFishingLoad(ctx *Ctx) ([]byte, bool) {
 	// 磨损按官服帧节奏中途落库并经 Push4_22Trees 下发裸部件子树。
 	// 严禁在这里做全量 4/22 同步——全量会重建鱼实体，打断冲刺与体力阶段。
 	ctx.Sess.Srv.recordFightReelLoad(ctx)
+	// 咬断线组以 14/8 为节拍：鱼在挣扎时按官方概率掷骰，命中即断组。
+	ctx.Sess.Srv.maybeBiteOff(ctx)
 	return nil, true
 }
 
@@ -1805,6 +1843,7 @@ func hFishingEnd(ctx *Ctx) ([]byte, bool) {
 	st.mu.Lock()
 	st.InWater = false
 	st.NeedBite = false
+	resetMarineLayerLocked(st)
 	st.mu.Unlock()
 	body, ok := ctx.Sess.Srv.fishingEndSettle(ctx)
 	ctx.Log.Info("14/4 收竿", "handled", ok, "bytes", len(body))

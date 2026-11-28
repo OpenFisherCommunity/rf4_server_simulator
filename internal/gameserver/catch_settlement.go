@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
 	"strings"
 	"time"
 
@@ -159,7 +158,10 @@ func (s *Server) settleCatchOnceWithQualification(ctx context.Context, uid int64
 		f.HappyHourKnown = true
 	}
 	happy := f.HappyHour
-	bait := state.Bait
+	// 多钩钓组里每尾鱼咬的是某一钩位，catch_log 记该钩位实际用的饵；
+	// state.Bait 只是"当前主饵"（rig 50-54 取第一枚拟饵），记它会
+	// 让所有渔获都显示同一款。旧快照没有 BaitItem 时回退原值。
+	bait := catchBaitItem(f, state.Bait)
 	state.mu.Unlock()
 	bonuses, err := s.rodXPBonuses(ctx, uid, gear, xp)
 	if err != nil {
@@ -244,8 +246,10 @@ func (s *Server) settleCatchOnceWithQualification(ctx context.Context, uid int64
 	// 存量库里的浮点累加尾差（如 99.99999999999996）量化到 0.1 显示格，
 	// 否则钳位后产生正残渣增量，客户端渲染「+0 = 100%」技能行。
 	oldSkill = store.QuantizeSkillPoints(oldSkill)
-	gain := math.Min(fishingProficiencyGainForRoll(oldSkill, happyHourProficiencyRoll(oldSkill, rand.Float64(), happy), rand.Float64()), math.Max(0, profCap-oldSkill))
-	gain = store.QuantizeSkillPoints(gain) // 钳位残渣（如 3.6e-14）归零，增量保持 0.1/0.2 格
+	// 后台填了固定百分比时按该百分比判定，不再叠加幸运时刻对原版概率的修正。
+	// f.Grade 叠加档位倍数：合格/奖杯/蓝冠按 skill_grade_mult_<grade> 放大增量。
+	gain := math.Min(s.proficiencyGainForCatchGrade(r.SkillID, f.Grade, oldSkill, happy), math.Max(0, profCap-oldSkill))
+	gain = store.QuantizeSkillPoints(gain) // 钳位残渣（如 3.6e-14）归零，增量对齐 0.1 显示格
 	r.SkillGain = &gain
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(weight_g),0) FROM catch_log WHERE uid=? AND fish_key=?`, uid, f.Species).Scan(&r.PreviousBest); err != nil {
 		return nil, err
@@ -258,7 +262,7 @@ func (s *Server) settleCatchOnceWithQualification(ctx context.Context, uid int64
 	// 14/5 入护只把这行的 source 从 'catch' 抬成 'keep'（见 KeepFishingCatchWithCapacity），
 	// 14/6 放生保持 'catch'：钓到过就是钓到过，图鉴、307.f16 星号、3/17 面板与
 	// 321 统计因此都不再区分放生与入护。
-	if err := insertCatchLogSettleTx(ctx, tx, uid, f, locLevel, catchLoc, catchSpot, bait,
+	if err := s.insertCatchLogSettleTx(ctx, tx, uid, f, locLevel, catchLoc, catchSpot, bait,
 		tackleCatForRig(rigType), xp, silver, now); err != nil {
 		return nil, err
 	}
@@ -349,6 +353,15 @@ func (s *Server) settleCatchOnceWithQualification(ctx context.Context, uid int64
 	return res, nil
 }
 
+// catchBaitItem 优先返回这尾鱼实际咬钩的饵；旧快照没有 BaitItem 时
+// 回退到当前主饵，保持旧档和 GM 武装鱼的行为不变。
+func catchBaitItem(f *RolledFish, fallback string) string {
+	if f != nil && f.BaitItem != "" {
+		return f.BaitItem
+	}
+	return fallback
+}
+
 // insertCatchLogSettleTx 在 14/4 结算事务内写下本尾鱼的钓获记录（source='catch'）。
 //
 // 落库时机是「钓到」而不是「入护」：官方结算界面在玩家选择入护或放生之前就已经
@@ -356,14 +369,21 @@ func (s *Server) settleCatchOnceWithQualification(ctx context.Context, uid int64
 // 只把同一行的 source 抬成 'keep'（见 KeepFishingCatchWithCapacity），14/6 放生
 // 保持 'catch'。唯一索引 uq_catch_log_fish_identity(uid, source, catch_guid)
 // 保证重放不会重复记账；结算本身还有 catch-settlement 回执兜底。
-func insertCatchLogSettleTx(ctx context.Context, tx *sql.Tx, uid int64, f *RolledFish,
+func (s *Server) insertCatchLogSettleTx(ctx context.Context, tx *sql.Tx, uid int64, f *RolledFish,
 	locLevel, loc string, spot int64, bait string, tackleCat, xp, silver int64, ts float64) error {
 	if tx == nil || f == nil || f.FishGUID == "" || f.Species == "" {
 		return nil
 	}
+	// hook 只是统计维度：钩子行不存在（sql.ErrNoRows）属于合法情况，留空串；
+	// 其它错误记 warn 后继续，不为一个统计字段回滚整笔结算。
 	hookItem := ""
 	if f.HookGUID != "" {
-		_ = tx.QueryRowContext(ctx, `SELECT item_id FROM item WHERE guid=?`, f.HookGUID).Scan(&hookItem)
+		if err := tx.QueryRowContext(ctx, `SELECT item_id FROM item WHERE guid=?`, f.HookGUID).Scan(&hookItem); err != nil {
+			if err != sql.ErrNoRows {
+				s.log.Warn("钓获记录钩子查询失败，hook 留空", "uid", uid, "fish", shortGUID(f.FishGUID), "err", err)
+			}
+			hookItem = ""
+		}
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO catch_log(
 		ts,loc,spot,fish_key,name_zh,weight_g,length_m,source,bait,grade,xp,silver,loc_level,uid,catch_guid,tackle_cat,hook)

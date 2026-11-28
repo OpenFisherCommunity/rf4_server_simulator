@@ -240,7 +240,7 @@ func (s *Server) marineTraits(ctx context.Context, key string, c fishRollContext
 		schooling: groundbaitClamp(.35+(activity-.7)*.45-(aggression-1)*.20+(1-layer)*.10, .05, .95),
 		chase:     groundbaitClamp(.15+(aggression-.8)*.55+p.CurrentPref*.20, .05, .95),
 		ambush:    groundbaitClamp(.15+layer*.60+(1.2-activity)*.20, .05, .95),
-		pit:       groundbaitClamp(.15+layer*.65+float64(p.RarityTier)*.04, .05, .95),
+		pit:       groundbaitClamp(.15+layer*.65+float64(p.Rarity)*.04, .05, .95),
 	}
 }
 
@@ -261,7 +261,9 @@ func marineActionMatch(c fishRollContext, t marineFishTraits) float64 {
 
 func marineDepthMatch(c fishRollContext, t marineFishTraits) float64 {
 	layer := normalizeWaterLayer(c.lureLayer)
-	if c.spotEnv.Known && c.spotEnv.DepthM > 0 {
+	if c.marineLayerKnown {
+		layer = normalizeWaterLayer(c.marineLayer)
+	} else if c.spotEnv.Known && c.spotEnv.DepthM > 0 {
 		layer = groundbaitClamp(c.spotEnv.DepthM/220, 0, 1)
 	}
 	return groundbaitClamp(1-math.Abs(layer-.58*t.pit-.20*t.ambush), .25, 1)

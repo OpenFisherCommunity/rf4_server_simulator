@@ -54,13 +54,13 @@ type lureAttributes struct {
 // 海图区号随之定位不到，“海图”前置条件整体失效。场景名必须先用 loc_alias 解析，
 // 与 cafe_orders、econ_market、fishing_weather_context 一致；解析不出来再回退。
 func (s *Server) resolveRollLevelKey(ctx context.Context, loc string) string {
-	if s == nil || s.DB == nil || loc == "" {
-		return travelLevelKey(loc)
+	if s != nil && s.DB != nil {
+		loc = s.DB.ResolveLevelKey(ctx, loc)
 	}
-	if key := s.DB.ResolveLevelKey(ctx, loc); key != "" {
-		return travelLevelKey(key)
+	if validLevelKey(loc) {
+		return loc
 	}
-	return travelLevelKey(loc)
+	return ""
 }
 
 func (s *Server) prepareFishRollRuntime(ctx context.Context, c *fishRollContext, statLoc string) {
@@ -80,34 +80,53 @@ func (s *Server) prepareFishRollRuntime(ctx context.Context, c *fishRollContext,
 	if !c.runtime.levelChecked {
 		c.runtime.levelChecked = true
 		levelKey := s.resolveRollLevelKey(ctx, c.loc)
+		c.runtime.levelKey = levelKey
 		c.runtime.chartKnown = sonarChartLevel(levelKey)
-		if strings.HasPrefix(c.loc, "loc12_") {
-			c.runtime.sonarSystemID = c.loc
-		}
-		if c.runtime.chartKnown {
-			// 海图区号以客户端上报的 loc12_N 为权威（2026-11-14 实测：海钓 14/2
-			// 落点是客户端局部坐标，不是世界坐标，按坐标反查永不命中——玩家真实
-			// 在 198 区时落点报 (-100,680)，而客户端 loc 恒为 loc12_198）。
-			// 坐标反查只作缺省回退。
-			if n, ok := sonarZoneFromLoc(c.loc); ok {
-				c.runtime.zone, c.runtime.zoneKnown = n, true
-			} else if c.hasPos {
-				c.runtime.zone, c.runtime.zoneKnown = sonarZoneForPoint(levelKey, c.x, c.z)
+		if c.runtime.chartKnown && c.hasPos && !c.playerPosOnly {
+			c.runtime.guideKnown = true
+			c.runtime.guideSpot = seaGuideSpotForPoint(c.x, c.z)
+			c.runtime.zone, c.runtime.zoneKnown = sonarZoneForPoint(levelKey, c.x, c.z)
+			if c.runtime.zoneKnown {
+				c.runtime.sonarSystemID = fmt.Sprintf("loc12_%02d", c.runtime.zone)
 			}
 		}
+	}
+	c.measuredWaterDepthM = 0
+	if floatRigTypes[c.rigType] {
+		// 只有饵的具体落点能查水深；区域估算和人物站位没有这项信息。
+		if c.hasPos && !c.playerPosOnly && (c.query == nil || !c.query.regional) {
+			c.measuredWaterDepthM, _ = localCastWaterDepthM(c.runtime.levelKey, c.x, c.z)
+		}
+		c.spotEnv.DepthM = c.measuredWaterDepthM
+	}
+	if c.audit != nil {
+		*c.audit = fishRollAudit{statLoc: statLoc, runtime: c.runtime}
 	}
 	if c.runtime.spotPref == nil {
 		c.runtime.spotPref, c.runtime.spotData = s.loadFishSpotPreference(ctx, statLoc, c)
 	}
-	if !c.runtime.lureKnown && c.rigType != 0 {
-		// 多拟饵取最深（与 lureDiveForGear 种子同源，评审 P3-1），
-		// 避免"种子用最深、fallback 用第一枚"的两套口径。
-		for _, id := range c.baits {
-			if lure, ok := s.loadLureAttributes(ctx, id); ok {
-				if !c.runtime.lureKnown || lure.DiveDepth > c.runtime.lure.DiveDepth {
-					c.runtime.lure, c.runtime.lureKnown = lure, true
+	// 拟饵属性必须跟当前这组饵对应：rollFishForRig 会逐钩换 c.baits，
+	// 只按 lureKnown 算一次会让后续钩位继续沿用第一钩的拟饵。
+	// 饵集合没变就复用结果（runtime 是整杆共享的），变了一次重算。
+	if c.rigType != 0 {
+		baitsKey := strings.Join(c.baits, "\x00")
+		if !c.runtime.lureKnown || c.runtime.lureBaitsKey != baitsKey {
+			// 多拟饵取最深（与 lureCoreForGear 种子同源，评审 P3-1），
+			// 避免"种子用最深、fallback 用第一枚"的两套口径。彩珠/发光管
+			// （lureType 17）是吸引成分，不参与判鱼，也不得抢主导拟饵。
+			var lure lureAttributes
+			lureKnown := false
+			for _, id := range c.baits {
+				item, ok := s.loadLureAttributes(ctx, id)
+				if !ok || item.TypeID == lureTypeAttraction {
+					continue
+				}
+				if !lureKnown || item.DiveDepth > lure.DiveDepth {
+					lure, lureKnown = item, true
 				}
 			}
+			c.runtime.lure, c.runtime.lureKnown = lure, lureKnown
+			c.runtime.lureBaitsKey = baitsKey
 		}
 	}
 }
@@ -147,35 +166,29 @@ func fnvHash(s string) uint64 {
 	return h
 }
 
-// loadFishSpotPreference 读取攻略钓点观测。挪威海的点位按海图区号记录，
-// 与客户端水域 systemID 的数字段同源，可以直接对上；内陆湖的点位是攻略地图
-// 上的网格文本（"67:57"），换不成客户端落点坐标，这里一律不启用，避免把
-// 别处的鱼种当成当前钓点的观测。
+// loadFishSpotPreference 按已定位的挪威海攻略钓点读取渔获观测。
+// 缺少图上标深的定位证据或只有内陆网格文本（如 "67:57"）时保持中性。
 func (s *Server) loadFishSpotPreference(ctx context.Context, statLoc string, c *fishRollContext) (map[string]float64, bool) {
 	out := map[string]float64{}
-	if s == nil || s.DB == nil || statLoc == "" || c == nil || c.runtime == nil || !c.runtime.zoneKnown {
+	if s == nil || s.DB == nil || statLoc == "" || c == nil || c.runtime == nil ||
+		!c.runtime.guideKnown || !isSeaGuideSpot(c.runtime.guideSpot) {
 		return out, false
 	}
 	rows, err := s.DB.SQL.QueryContext(ctx,
-		`SELECT spot,fish_key,catches FROM spot_fish WHERE loc=?`, statLoc)
+		`SELECT fish_key,catches FROM spot_fish WHERE loc=? AND spot=?`, statLoc, strconv.Itoa(c.runtime.guideSpot))
 	if err != nil {
 		return out, false
 	}
 	defer rows.Close()
-	target := strconv.Itoa(c.runtime.zone)
-	matched := false
 	for rows.Next() {
-		var spot, fish string
+		var fish string
 		var catches int64
-		if rows.Scan(&spot, &fish, &catches) != nil || catches <= 0 {
+		if rows.Scan(&fish, &catches) != nil || catches <= 0 {
 			continue
 		}
-		if spot == target {
-			matched = true
-			out[fish] += math.Sqrt(float64(catches))
-		}
+		out[fish] += math.Sqrt(float64(catches))
 	}
-	return out, matched
+	return out, len(out) > 0
 }
 
 // applyFishSpotBias 只在静态库对该地点存在钓点观测时启用。匹配到当前钓点的
@@ -277,21 +290,45 @@ func (s *Server) loadLureAttributes(ctx context.Context, id string) (lureAttribu
 	return lure, true
 }
 
-// lureDiveForGear 取竿上当前装配拟饵的最大名义泳层（DiveDepth）。
-// 多拟饵/多钩钓组取最深：钓组运行水层由最深拟饵决定（评审 P2-3）；
-// 单拟饵不变；无拟饵装配或无证据返回 0。抛竿时种子进 FishState.LureDive，
-// 供 14/7 运动推导钳制与判鱼 fallback 使用，高频路径不再回查 DB。
-func (s *Server) lureDiveForGear(ctx context.Context, gearGUID string) float64 {
+// lureTypeAttraction 彩珠/发光管等吸引成分的拟饵类型（item_def.mbemakijdeh=17）。
+// 它们只作装饰，不参与判鱼，也不得参与 pace 复合分的动作权重。
+const lureTypeAttraction int64 = 17
+
+// lureCoreForGear 取竿上当前装配拟饵的名义泳层（DiveDepth）与类型名。
+// 多拟饵/多钩钓组取最深：钓组运行水层由最深拟饵决定（评审 P2-3），类型名取
+// 同一枚最深拟饵——pace 复合分的动作权重按主导拟饵计；单拟饵不变；无拟饵
+// 装配或无证据返回 0/""。抛竿时种子进 FishState.LureDive/LureType，供 14/7
+// 运动推导钳制、判鱼 fallback 与 pace 复合档位使用，高频路径不再回查 DB。
+func (s *Server) lureCoreForGear(ctx context.Context, gearGUID string) (float64, string) {
 	if s == nil || s.DB == nil || gearGUID == "" {
-		return 0
+		return 0, ""
 	}
+	return s.lureCoreForBaits(ctx, s.currentBaits(ctx, gearGUID))
+}
+
+// lureCoreForBaits 一组饵里的最深真实拟饵。吸引成分（lureType 17）不参与
+// 判鱼，也不得抢主导拟饵：海图多钩钓组的 color_bead DiveDepth 0.78 比铁板
+// 0.76 更深，曾把 LureType 判成 "bead"，动作权重表查不到而全部回退中性。
+func (s *Server) lureCoreForBaits(ctx context.Context, baits []string) (float64, string) {
 	deepest := 0.0
-	for _, bait := range s.currentBaits(ctx, gearGUID) {
-		if lure, ok := s.loadLureAttributes(ctx, bait); ok && lure.DiveDepth > deepest {
+	typeName := ""
+	for _, bait := range baits {
+		lure, ok := s.loadLureAttributes(ctx, bait)
+		if !ok || lure.TypeID == lureTypeAttraction {
+			continue
+		}
+		if lure.DiveDepth > deepest || typeName == "" {
 			deepest = lure.DiveDepth
+			typeName = lure.Type
 		}
 	}
-	return deepest
+	return deepest, typeName
+}
+
+// lureTypeForBaits 一组饵里的主导拟饵类型（最深真实拟饵，排除吸引成分）。
+func (s *Server) lureTypeForBaits(ctx context.Context, baits []string) string {
+	_, typeName := s.lureCoreForBaits(ctx, baits)
+	return typeName
 }
 
 func lureIntAttr(attrs map[string]any, key string) int64 {
@@ -537,14 +574,19 @@ func fishWaterConditionsFor(profile fishEcologyProfile, c fishRollContext) fishW
 	daylight := clampFloat((1+math.Cos((float64(hour)-12)*math.Pi/12))/2, 0, 1)
 	layer := .45
 	switch {
+	case marineRigType(c.rigType) && c.marineLayerKnown:
+		layer = normalizeWaterLayer(c.marineLayer)
 	case bottomRigTypes[c.rigType]:
 		layer = .93
 	case rigTypeLureFamily[c.rigType]:
 		layer = effectiveLureLayer(c)
 	case c.depthCM > 0:
-		// 与 rigWaterLayer 同口径保持 5m 满刻度；实际水深归一会让区域
-		// 批量捕获与逐点生产权重对不上（评审 P2-2 回退）。
-		layer = normalizeWaterLayer(float64(c.depthCM) / 500)
+		// 光照和水温按实际浸入深度计算；25 厘米水深处的底饵仍属于浅水环境。
+		depthM := float64(c.depthCM) / 100
+		if c.measuredWaterDepthM > 0 {
+			depthM = math.Min(depthM, c.measuredWaterDepthM)
+		}
+		layer = normalizeWaterLayer(depthM / 5)
 	}
 	thermalResponse := .36 + .16*clampFloat(profile.Activity, .5, 1.5)
 	surface := seasonalAir + (air-seasonalAir)*thermalResponse + daylight*1.2
@@ -697,7 +739,11 @@ func (s *Server) fishLureWeight(profile fishEcologyProfile, c fishRollContext, w
 	if lure.DiveDepthM > 0 && c.spotEnv.DepthM > 0 {
 		diveDepth = clampFloat(lure.DiveDepthM/c.spotEnv.DepthM, 0, 1)
 	}
-	depthDistance := math.Abs(effectiveLureLayer(c) - diveDepth)
+	targetLayer := effectiveLureLayer(c)
+	if c.marineLayerKnown {
+		targetLayer = normalizeWaterLayer(c.marineLayer)
+	}
+	depthDistance := math.Abs(targetLayer - diveDepth)
 	depthMatch := .72 + .28*math.Exp(-depthDistance*depthDistance*6)
 	colorWeight := 1.0
 	if lure.ColorKnown {

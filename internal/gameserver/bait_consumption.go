@@ -57,7 +57,11 @@ func (s *Server) baitedHookSets(ctx context.Context, rod string) []baitedHookSet
 		return nil
 	}
 	groups := map[int64]*baitedHookSet{}
-	for _, category := range []int64{catBait, catLure} {
+	// 27 类天然饵在 rig 50-54 上只是吸引成分，但仍要挂在钩位上参与
+	// 分组、扣饵和补饵；判鱼候选由 rollFishForRig 里的 marineLureBaits
+	// 过滤，不能在这里整类跳过，否则多钩的饵分组会全部丢失。
+	categories := []int64{catBait, catLure}
+	for _, category := range categories {
 		for _, key := range rigCompKeysOfCategory(comps, category) {
 			comp := comps[key]
 			row, err := s.DB.GetItemByGUID(ctx, comp.GUID)
@@ -186,6 +190,13 @@ func (t hookAnchorTable) mainHook() string {
 	return hook
 }
 
+// isMainLureSlot 判断组件是否落在该钓组的主线拟饵槽（模板里 17 类的第一个索引）。
+// 只用于海钓拟饵族 50-54：300 是柳叶亮片/铁板主饵，325/326 是吸引成分。
+func isMainLureSlot(rigType, extra int64) bool {
+	idx := slotIndicesFor(rigType, catLure)
+	return len(idx) > 0 && extra == idx[0]
+}
+
 // baitHookAssignments 把已挂载的饵/拟饵分到钓组钩位上，返回 饵GUID → 钩GUID。
 //
 // 分配优先级：
@@ -204,6 +215,7 @@ func (t hookAnchorTable) mainHook() string {
 // 整批作废改用结构配对，并把纠正结果回写。
 func (s *Server) baitHookAssignments(ctx context.Context, rod string, comps map[int64]rigComp, single bool) (map[string]string, error) {
 	assigned := map[string]string{}
+	rigType := s.rigTypeForWrite(ctx, rod)
 	hooks := rigCompKeysOfCategory(comps, catHook)
 	mounted, rigHook := map[string]bool{}, map[string]bool{}
 	for _, key := range hooks {
@@ -324,9 +336,14 @@ func (s *Server) baitHookAssignments(ctx context.Context, rod string, comps map[
 					// 但记录必须落在本钓组的钩组件上：实机 2026-11-13 07:40
 					// 主线拟饵被记到它自带的三本钩（内嵌引用 04047060… 早已失效），
 					// 结果主线钩 250 整枚空置，4 个钩位只剩 3 个真钩能用。
-					// 没有记录的主线装饰（亮片/发光管）仍然不分配，不凭空占钩位。
+					// 没有记录的主线装饰（亮片/发光管）仍然不分配，不凭空占钩位；
+					// 但主线拟饵槽（rig 50-54 的 300）是主饵，无记录时归主线钩，
+					// 否则 Jiggmeister 这类主饵整个不参与判鱼，只剩子槽软饵。
 					hook = explicit[comp.GUID]
 					if hook != "" && !rigHook[strings.ToLower(hook)] {
+						hook = mainHook
+					}
+					if hook == "" && cat == catLure && marineLureRig(rigType) && isMainLureSlot(rigType, comp.Extra) {
 						hook = mainHook
 					}
 				}
@@ -827,6 +844,18 @@ func (s *Server) consumeCastBait(sess *Session, st *FishState) error {
 	if err == nil {
 		sess.pushBaitChange(change)
 		s.depositCastGroundbait(sess, st, change, fmt.Sprintf("%s:%d", rod, cast.UnixNano()))
+		// 本杆入水真正扣掉品类 30 的 PVA 棒，才算「抛掷了装备 PVA 棒的钓组」。
+		// 重放时 consumeBaitEvent 返回的是同一份扣料回执，标记结果一致。
+		pva := false
+		for _, use := range change.Groundbait {
+			if use.Category == catPVAStick {
+				pva = true
+				break
+			}
+		}
+		st.mu.Lock()
+		st.PVAReady = pva
+		st.mu.Unlock()
 	}
 	return err
 }
@@ -885,7 +914,8 @@ func (s *Server) reloadBaitForCast(ctx context.Context, uid int64, rod string) (
 			}
 			request.HookGUID = comps[hooks[0]].GUID
 		}
-		if _, _, present := rigCompKeyForGUID(comps, request.HookGUID); !present {
+		_, targetHook, present := rigCompKeyForGUID(comps, request.HookGUID)
+		if !present {
 			if _, err := s.DB.SQL.ExecContext(ctx, `DELETE FROM rod_setting WHERE guid=? AND key=?`, rod, key); err != nil {
 				return out, err
 			}
@@ -902,7 +932,16 @@ func (s *Server) reloadBaitForCast(ctx context.Context, uid int64, rod string) (
 					break
 				}
 			}
-			mountOrdinal = int64(len(rigCompKeysOfCategory(comps, catBait)))
+			if hasFixedMarineBaitSlots(rigType) {
+				// 固定饵位不能按剩余件数追加：仅剩 351 时补第一钩会覆盖它。
+				if targetHook.Extra == 250 || targetHook.Extra == 251 {
+					mountOrdinal = targetHook.Extra - 250
+				}
+				_, slotTaken := comps[rigCompKey(catBait, mountOrdinal)]
+				occupied = occupied || slotTaken
+			} else {
+				mountOrdinal = int64(len(rigCompKeysOfCategory(comps, catBait)))
+			}
 		} else {
 			_, occupied = comps[rigCompKey(catBait, ordinal)]
 		}
@@ -946,7 +985,7 @@ func (s *Server) reloadBaitForCast(ctx context.Context, uid int64, rod string) (
 				if err := s.DB.UpsertRodSetting(ctx, rod, "bait_hook:"+result.MountedGUID, request.HookGUID); err != nil {
 					return out, err
 				}
-				if multi {
+				if multi && !hasFixedMarineBaitSlots(rigType) {
 					if err := s.orderBaitsByHook(ctx, uid, rod); err != nil {
 						return out, err
 					}
@@ -1020,12 +1059,7 @@ func (s *Server) orderBaitsByHook(ctx context.Context, uid int64, rod string) er
 	if err := updateItemFieldsTx(ctx, s.DB, tx, parent, fields); err != nil {
 		return err
 	}
-	components := make([]store.RigComponent, 0, len(comps))
-	for _, comp := range comps {
-		components = append(components, store.RigComponent{
-			Slot: comp.Category, Ordinal: comp.Ordinal, GUID: comp.GUID, Extra: comp.Extra,
-		})
-	}
+	components := rigProjection(parent.WireClass, fields, fields[idx].Val)
 	if err := s.DB.ReplaceRigComponentsTx(ctx, tx, rod, components); err != nil {
 		return err
 	}
