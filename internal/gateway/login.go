@@ -216,8 +216,15 @@ func (s *LoginServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		// HTTPS 作者通道继续使用 4 段 logintoken。
+		// HTTPS 作者通道继续使用 4 段 logintoken。realtime 认证只认 gw_token 里的
+		// 签发记录，因此它必须和 token 一样登记，否则客户端拿它接 realtime 会被拒。
 		logintoken = NewLogintoken(userid)
+		if err := s.store.SaveToken(r.Context(), logintoken, info, ttl); err != nil {
+			loginErrors.Inc()
+			s.log.Error("保存 logintoken 失败", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 		xml = fmt.Sprintf(loginXMLTpl,
 			s.cfg.AdvertiseHost, s.cfg.AdvertisePort,
 			s.cfg.Region, s.cfg.ServerName, userid,
