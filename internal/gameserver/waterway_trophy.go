@@ -261,11 +261,5 @@ func (s *Session) pushWaterwayTrophies(items []*store.Item) {
 	if s == nil || len(items) == 0 {
 		return
 	}
-	guids := make([]string, 0, len(items))
-	for _, it := range items {
-		if it != nil && it.GUID != "" {
-			guids = append(guids, it.GUID)
-		}
-	}
-	s.Push4_22ItemGUIDs(guids)
+	s.pushAwardItems(items)
 }

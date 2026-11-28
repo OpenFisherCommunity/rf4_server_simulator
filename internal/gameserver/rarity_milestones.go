@@ -211,7 +211,7 @@ func pushRarityMilestoneItems(sess *Session, items []*store.Item) {
 	}
 	for _, it := range items {
 		if it != nil {
-			sess.Srv.pushItemUpdate(sess.Userid, it)
+			sess.Srv.pushAwardUpdate(sess.Userid, it)
 		}
 	}
 }

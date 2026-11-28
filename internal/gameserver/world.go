@@ -91,10 +91,19 @@ func hItemMove(ctx *Ctx) ([]byte, bool) {
 		dstKind = ints[1]
 	}
 	dst := containerName(dstKind)
+	// 奖赏容器（14）不是独立仓库：把奖赏放到房屋展示位时，物品仍落
+	// house，只是 wire 树继续留在奖赏分组 14。回退成 backpack 会让
+	// 已拥有的奖赏从房屋/奖赏里消失。
+	rewardDst := dstKind == containerRewards
+	if rewardDst {
+		dst = "house"
+	}
 	cctx := ctx.Sess.pushCtx()
 	houseCap := int64(houseContainerCapacity)
 	if dst == "house" {
-		houseCap, _ = srv.importedContainerCapacity(cctx, ctx.Sess.Userid, dstKind, houseCap, 0)
+		// 目标物理落库始终是 house（容器 10）；客户端传来的 14 只是奖赏
+		// 分组投影，不能拿它的导入容量覆盖房屋上限。
+		houseCap, _ = srv.importedContainerCapacity(cctx, ctx.Sess.Userid, 10, houseCap, 0)
 	}
 	tx, err := beginEconomyTx(cctx, srv.DB)
 	if err != nil {
@@ -158,7 +167,11 @@ func hItemMove(ctx *Ctx) ([]byte, bool) {
 	}
 
 	for _, row := range pending {
-		if tree, terr := srv.ItemToTree(cctx, row); terr == nil {
+		tree, terr := srv.ItemToTree(cctx, row)
+		if rewardDst && row.WireClass == "enikeammfen" && row.TypeID == 2015 {
+			tree, terr = srv.awardItemTree(cctx, row)
+		}
+		if terr == nil {
 			ctx.Sess.Push(4, 21, proto.Args524(proto.GuidArr([]string{row.GUID})))
 			ctx.Sess.Push(4, 22, proto.Args(proto.S("61"), tree))
 		}
